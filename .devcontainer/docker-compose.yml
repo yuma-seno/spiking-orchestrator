@@ -20,5 +20,7 @@ services:
             - /mnt/wslg:/mnt/wslg
             - /dev/bus/usb:/dev/bus/usb
             - /dev/snd:/dev/snd
+        devices:
+            - "/dev/snd:/dev/snd"
         tty: true
         stdin_open: true

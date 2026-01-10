@@ -36,3 +36,6 @@ colorama
 python-dotenv
 # グラフ描画 (デバッグ時の波形確認用)
 matplotlib
+
+# --- Dev / Test ---
+pytest

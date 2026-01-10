@@ -11,6 +11,7 @@ ENV CONTAINER_USER=$CONTAINER_USER
 RUN useradd -ms /bin/bash $CONTAINER_USER
 RUN echo $CONTAINER_USER:password | chpasswd
 RUN echo "$CONTAINER_USER   ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+RUN usermod -aG audio $CONTAINER_USER || true
 
 # ユーザID等をホストに合わせる
 COPY --chown=$CONTAINER_USER --chmod=755 .devcontainer/entrypoint.sh /
@@ -24,6 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-ipafont \
     python3-tk \
     portaudio19-dev \
+    alsa-utils \
+    libasound2-plugins \
+    libpulse0 \
     libsndfile1 \
     ffmpeg && \
     apt-get clean && \
