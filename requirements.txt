@@ -1,0 +1,38 @@
+# --- Core System: Spiking Neural Network (The Controller) ---
+# SNN構築用のメインライブラリ
+spikingjelly>=0.0.0.0.12
+# 行列演算・SNNのバックエンド (GPU対応版を推奨※)
+torch
+torchvision
+torchaudio
+
+# --- Fast Path: Real-time Audio Processing (Reflex) ---
+# マイク入力・スピーカー出力用
+PyAudio
+# 数値計算・信号処理 (RMS計算など)
+numpy
+scipy
+
+# --- Slow Path: Meaning Extraction (Hearing) ---
+# HuBERTなどの事前学習済みモデルを利用
+transformers
+accelerate
+# 音声ファイル処理
+librosa
+soundfile
+
+# --- Cognitive Engine: LLM (Thinking) ---
+# RWKVモデルの実行用
+rwkv
+# トークナイザーなど
+tokenizers
+
+# --- Output & Utils (Speaking & Debug) ---
+# HTTP通信 (VOICEVOXエンジン等へのAPIコール用)
+requests
+# ターミナルでの色付きログ表示 (脳波モニタリング風表示用)
+colorama
+# 環境変数管理 (.env)
+python-dotenv
+# グラフ描画 (デバッグ時の波形確認用)
+matplotlib

@@ -1,0 +1,24 @@
+services:
+    python:
+        build:
+            context: ..
+            dockerfile: .devcontainer/Dockerfile
+            args:
+                CONTAINER_USER: vscode
+                CONTAINER_WORKDIR: /workspace
+        environment:
+            PYTHONPATH: /workspace
+            DISPLAY: $DISPLAY
+            PULSE_SERVER: $PULSE_SERVER
+            WAYLAND_DISPLAY: $WAYLAND_DISPLAY
+            XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR
+        network_mode: "host"
+        volumes:
+            - ..:/workspace
+            - /tmp/.X11-unix:/tmp/.X11-unix
+            - ~/.Xauthority:/root/.Xauthority
+            - /mnt/wslg:/mnt/wslg
+            - /dev/bus/usb:/dev/bus/usb
+            - /dev/snd:/dev/snd
+        tty: true
+        stdin_open: true
