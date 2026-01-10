@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12
 
 RUN apt-get update && apt-get install -y --no-install-recommends sudo
 
@@ -19,18 +19,15 @@ CMD ["/bin/bash"]
 
 # pythonのグラフ表示や日本語フォントやx11アプリケーションのためのパッケージをインストール
 # ホスト側で [xhost + local:] を実行しておくこと
-RUN apt update && apt install -y --no-install-recommends  \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-apps \
     fonts-ipafont \
-    git \
-    python3-dev \
-    python3-pip \
     python3-tk \
-    gcc \
-    build-essential \
     portaudio19-dev \
     libsndfile1 \
-    ffmpeg
+    ffmpeg && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN pip install --upgrade pip
 
