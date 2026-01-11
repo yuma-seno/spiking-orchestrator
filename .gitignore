@@ -27,7 +27,15 @@ htmlcov/
 
 # Outputs: keep human-readable reports, ignore bulky raw artifacts
 outputs/**
+
+# Unignore report directories (needed because parent dirs are ignored)
+!outputs/phase1/
+!outputs/phase1/report/
 !outputs/phase1/report/**/*.md
+
+!outputs/phase2/
+!outputs/phase2/mc/
+!outputs/phase2/mc/reports/
 !outputs/phase2/mc/reports/**/*.md
 
 # Optional: keep placeholder files if used
