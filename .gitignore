@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+ENV/
+
+# Tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Outputs: keep human-readable reports, ignore bulky raw artifacts
+outputs/**
+!outputs/phase1/report/**/*.md
+!outputs/phase2/mc/reports/**/*.md
+
+# Optional: keep placeholder files if used
+!outputs/**/.gitkeep

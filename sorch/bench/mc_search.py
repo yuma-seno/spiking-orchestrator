@@ -4,11 +4,13 @@ import argparse
 import csv
 import itertools
 import math
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
+from sorch.core.mc_experiment import generate_input
 from sorch.core.memory_capacity import memory_capacity
 from sorch.core.reservoir_stp import ReservoirConfig, STPReservoir
 from sorch.core.stp_lif_node import STPConfig
@@ -68,6 +70,8 @@ class SearchRow:
     washout: int
     max_delay: int
     ridge: float
+    input_mode: str
+    input_params: str
     input_bias: float
     sparsity: float
     input_scale: float
@@ -86,7 +90,30 @@ def main() -> int:
     ap.add_argument("--washout", type=int, default=800)
     ap.add_argument("--max-delay", type=int, default=200)
     ap.add_argument("--ridge", type=float, default=1e-3)
+    ap.add_argument(
+        "--preset",
+        type=str,
+        default="none",
+        choices=["none", "convo"],
+        help="convenience preset (overrides input-related args)",
+    )
+    ap.add_argument(
+        "--input-mode",
+        type=str,
+        default="uniform",
+        choices=["uniform", "gaussian", "burst", "convo"],
+        help="input signal mode for u(t)",
+    )
     ap.add_argument("--input-bias", type=float, default=0.0, help="added to u(t) to shift mean")
+    ap.add_argument("--input-low", type=float, default=-1.0, help="uniform: low")
+    ap.add_argument("--input-high", type=float, default=1.0, help="uniform: high")
+    ap.add_argument("--input-std", type=float, default=0.5, help="gaussian/burst/convo: std")
+    ap.add_argument("--input-clip", type=float, default=1.0, help="clip abs(u) if > 0")
+    ap.add_argument("--tempo-on-min", type=int, default=20, help="burst/convo: on duration min (steps)")
+    ap.add_argument("--tempo-on-max", type=int, default=200, help="burst/convo: on duration max (steps)")
+    ap.add_argument("--tempo-off-min", type=int, default=20, help="burst/convo: off duration min (steps)")
+    ap.add_argument("--tempo-off-max", type=int, default=200, help="burst/convo: off duration max (steps)")
+    ap.add_argument("--tempo-amp", type=float, default=1.0, help="burst/convo: amplitude multiplier")
 
     ap.add_argument("--U", type=float, default=0.2)
     ap.add_argument("--tauF-ms", type=str, default="100:800:100")
@@ -108,6 +135,16 @@ def main() -> int:
     ap.add_argument("--out", type=str, default="outputs/phase2_mc_grid.csv")
     args = ap.parse_args()
 
+    if str(args.preset) == "convo":
+        args.input_mode = "convo"
+        args.input_std = 0.6
+        args.input_clip = 1.0
+        args.tempo_on_min = 50
+        args.tempo_on_max = 250
+        args.tempo_off_min = 80
+        args.tempo_off_max = 400
+        args.tempo_amp = 1.0
+
     tauF_list = _parse_list_or_range(args.tauF_ms)
     tauD_list = _parse_list_or_range(args.tauD_ms)
     w_list = _parse_list_or_range(args.w_scale)
@@ -120,10 +157,38 @@ def main() -> int:
     # Stable input per seed.
     for rep in range(int(args.repeats)):
         seed = int(args.seed) + rep
-        rng = np.random.default_rng(seed)
-        u = rng.uniform(low=-1.0, high=1.0, size=int(args.steps)).astype(np.float32)
-        if float(args.input_bias) != 0.0:
-            u = (u + float(args.input_bias)).astype(np.float32)
+        u = generate_input(
+            seed=seed,
+            steps=int(args.steps),
+            mode=str(args.input_mode),
+            input_bias=float(args.input_bias),
+            low=float(args.input_low),
+            high=float(args.input_high),
+            std=float(args.input_std),
+            clip=float(args.input_clip),
+            tempo_on_min=int(args.tempo_on_min),
+            tempo_on_max=int(args.tempo_on_max),
+            tempo_off_min=int(args.tempo_off_min),
+            tempo_off_max=int(args.tempo_off_max),
+            tempo_amp=float(args.tempo_amp),
+        )
+
+        input_params = json.dumps(
+            {
+                "mode": str(args.input_mode),
+                "low": float(args.input_low),
+                "high": float(args.input_high),
+                "std": float(args.input_std),
+                "clip": float(args.input_clip),
+                "tempo_on_min": int(args.tempo_on_min),
+                "tempo_on_max": int(args.tempo_on_max),
+                "tempo_off_min": int(args.tempo_off_min),
+                "tempo_off_max": int(args.tempo_off_max),
+                "tempo_amp": float(args.tempo_amp),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
 
         for tauF_ms, tauD_ms, w_scale in itertools.product(tauF_list, tauD_list, w_list):
             stp = STPConfig(U=float(args.U), tau_F=float(tauF_ms) / 1000.0, tau_D=float(tauD_ms) / 1000.0)
@@ -162,6 +227,8 @@ def main() -> int:
                 washout=int(args.washout),
                 max_delay=int(args.max_delay),
                 ridge=float(args.ridge),
+                input_mode=str(args.input_mode),
+                input_params=input_params,
                 input_bias=float(args.input_bias),
                 sparsity=float(args.sparsity),
                 input_scale=float(args.input_scale),
