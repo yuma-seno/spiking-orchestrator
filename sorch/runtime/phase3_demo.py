@@ -11,6 +11,7 @@ import numpy as np
 
 from sorch.audio.features import AudioFeatures, compute_features
 from sorch.ipc.spsc_ring import SharedSpscRing, SpscRingHandle
+from sorch.ipc.stop_flag import StopFlagHandle
 from sorch.reflex.dsp_reflex import ReflexConfig, ReflexDSP
 from sorch.utils.metrics import summarize_latencies_ns
 
@@ -158,6 +159,7 @@ def _core_proc(
     *,
     feat_ring: SpscRingHandle,
     stop_ring: SpscRingHandle,
+    stop_flag: StopFlagHandle,
     shutdown_event,
     holdoff_ms: float,
     dt_ms: float,
@@ -173,6 +175,10 @@ def _core_proc(
             alpha=0.03,
         )
     )
+
+    from sorch.ipc.stop_flag import StopFlag
+
+    sf = StopFlag(stop_flag)
 
     try:
         while not shutdown_event.is_set():
@@ -194,6 +200,8 @@ def _core_proc(
             t_decision_ns = time.perf_counter_ns()
 
             if decision.stop_signal:
+                # Priority path: publish stop flag first.
+                sf.publish(t_read_done_ns=t_read_done_ns, t_feat_done_ns=t_feat_done_ns, t_decision_ns=t_decision_ns)
                 stop_msg = np.array(
                     [
                         float(t_read_done_ns),
@@ -220,6 +228,7 @@ def _core_proc(
 def _motor_proc(
     *,
     stop_ring: SpscRingHandle,
+    stop_flag: StopFlagHandle,
     shutdown_event,
     out_jsonl: str,
     seconds: float,
@@ -235,6 +244,10 @@ def _motor_proc(
 ) -> None:
     stop_rb = SharedSpscRing.attach(stop_ring)
 
+    from sorch.ipc.stop_flag import StopFlag
+
+    sf = StopFlag(stop_flag)
+
     out_path = Path(out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -243,6 +256,11 @@ def _motor_proc(
     output_stream = None
     pa = None
     out_buf = b""
+
+    # Callback-controlled output is preferred to reduce stop latency.
+    output_enabled = True
+    last_seen_seq = 0
+    pending_stop_event: Phase3StopEvent | None = None
 
     t_end = time.perf_counter() + float(seconds)
     last_resume_ns = 0
@@ -272,6 +290,42 @@ def _motor_proc(
 
             if output_mode != "off":
                 try:
+                    def callback(in_data, frame_count, time_info, status_flags):  # noqa: ANN001
+                        nonlocal output_enabled, last_seen_seq, pending_stop_event
+
+                        seq, t_read_done_ns, t_feat_done_ns, t_decision_ns = sf.snapshot()
+                        if seq != last_seen_seq:
+                            last_seen_seq = seq
+                            # immediate hard stop: silence output
+                            output_enabled = False
+                            t_stop_done_ns = time.perf_counter_ns()
+                            pending_stop_event = Phase3StopEvent(
+                                seq=int(seq),
+                                t_read_done_ns=int(t_read_done_ns),
+                                t_feat_done_ns=int(t_feat_done_ns),
+                                t_decision_ns=int(t_decision_ns),
+                                t_stop_done_ns=int(t_stop_done_ns),
+                                latency_ns=int(t_stop_done_ns - int(t_read_done_ns)),
+                                rms=0.0,
+                                zcr=0.0,
+                                centroid_hz=0.0,
+                                voicing=False,
+                                threshold=0.0,
+                                reason="stop_flag",
+                            )
+
+                        if not output_enabled:
+                            return (b"\x00" * (frame_count * ch * 4), pyaudio.paContinue)
+
+                        if out_buf:
+                            # out_buf is precomputed for the configured frame size; for safety,
+                            # match frame_count exactly by slicing.
+                            need = frame_count * ch * 4
+                            if len(out_buf) >= need:
+                                return (out_buf[:need], pyaudio.paContinue)
+
+                        return (b"\x00" * (frame_count * ch * 4), pyaudio.paContinue)
+
                     output_stream = pa.open(
                         format=pyaudio.paFloat32,
                         channels=ch,
@@ -279,6 +333,7 @@ def _motor_proc(
                         output=True,
                         frames_per_buffer=out_frames,
                         output_device_index=output_device,
+                        stream_callback=callback,
                         start=True,
                     )
                 except Exception as e:  # noqa: BLE001
@@ -289,33 +344,31 @@ def _motor_proc(
                         "- コンテナ内で /dev/snd が見えているか確認\n"
                     ) from e
 
-                # Prime output so stop has something to stop.
-                for _ in range(10):
-                    output_stream.write(out_buf)
+                # In callback mode, no explicit priming is needed.
 
         with out_path.open("w", encoding="utf-8") as f:
             while (not shutdown_event.is_set()) and (time.perf_counter() < t_end):
-                if output_stream is not None and out_buf:
-                    if output_stream.is_active():
-                        output_stream.write(out_buf)
-                    else:
-                        if last_resume_ns and (time.perf_counter_ns() - last_resume_ns) >= int(resume_after_ms * 1e6):
-                            output_stream.start_stream()
-                            last_resume_ns = 0
+                # Persist stop events captured by the callback.
+                if pending_stop_event is not None:
+                    f.write(json.dumps(asdict(pending_stop_event), ensure_ascii=False) + "\n")
+                    f.flush()
+                    pending_stop_event = None
+                    last_resume_ns = time.perf_counter_ns()
+
+                # Resume output after cooldown (demo convenience).
+                if (not output_enabled) and last_resume_ns and (time.perf_counter_ns() - last_resume_ns) >= int(
+                    resume_after_ms * 1e6
+                ):
+                    output_enabled = True
+                    last_resume_ns = 0
 
                 msg = stop_rb.pop()
                 if msg is None:
                     time.sleep(0.0002)
                     continue
 
-                # Hard Stop path: stop stream first, then timestamp.
-                if output_stream is not None and output_stream.is_active():
-                    output_stream.stop_stream()
-                    t_stop_done_ns = time.perf_counter_ns()
-                    last_resume_ns = t_stop_done_ns
-                else:
-                    t_stop_done_ns = time.perf_counter_ns()
-
+                # Keep the ring-based events too (they include threshold and features).
+                t_stop_done_ns = time.perf_counter_ns()
                 seq += 1
                 ev = Phase3StopEvent(
                     seq=seq,
@@ -401,6 +454,10 @@ def main() -> int:
     feat_rb = SharedSpscRing.create(capacity=2048, item_shape=(6,), dtype=np.float64)
     stop_rb = SharedSpscRing.create(capacity=256, item_shape=(8,), dtype=np.float64)
 
+    from sorch.ipc.stop_flag import StopFlag
+
+    stop_flag = StopFlag.create(ctx)
+
     try:
         p_audio = ctx.Process(
             target=_audio_proc,
@@ -422,6 +479,7 @@ def main() -> int:
             kwargs=dict(
                 feat_ring=feat_rb.handle(),
                 stop_ring=stop_rb.handle(),
+                stop_flag=stop_flag.handle(),
                 shutdown_event=shutdown_event,
                 holdoff_ms=float(args.holdoff_ms),
                 dt_ms=float(dt_ms),
@@ -433,6 +491,7 @@ def main() -> int:
             target=_motor_proc,
             kwargs=dict(
                 stop_ring=stop_rb.handle(),
+                stop_flag=stop_flag.handle(),
                 shutdown_event=shutdown_event,
                 out_jsonl=str(args.output),
                 seconds=float(args.seconds),
