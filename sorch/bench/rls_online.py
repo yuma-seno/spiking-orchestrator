@@ -10,9 +10,10 @@ from pathlib import Path
 import numpy as np
 
 from sorch.core.mc_experiment import generate_input
-from sorch.core.memory_capacity import memory_capacity
+from sorch.core.memory_capacity import r2_score
 from sorch.core.random_projection import RandomProjection
 from sorch.core.reservoir_stp import ReservoirConfig, STPReservoir
+from sorch.core.rls import RLS
 from sorch.core.stp_lif_node import STPConfig
 
 
@@ -47,14 +48,6 @@ def _parse_list_or_range(spec: str) -> list[int]:
     return [int(s)]
 
 
-def _parse_state_modes(spec: str) -> list[str]:
-    parts = [p.strip() for p in str(spec).split(",")]
-    modes = [p for p in parts if p]
-    if not modes:
-        raise ValueError("state modes spec is empty")
-    return modes
-
-
 def _parse_state_mode(mode: str) -> tuple[str, tuple[str, ...]]:
     allowed = {"v", "spike", "u", "r", "eff"}
     aliases = {"s": "spike"}
@@ -63,14 +56,12 @@ def _parse_state_mode(mode: str) -> tuple[str, tuple[str, ...]]:
     if not raw:
         raise ValueError("empty state mode")
 
-    # Accept either '+' or ',' as separators within a single mode.
     tokens = [t.strip() for t in raw.replace(",", "+").split("+") if t.strip()]
     tokens = [aliases.get(t, t) for t in tokens]
     unknown = [t for t in tokens if t not in allowed]
     if unknown:
         raise ValueError(f"unknown state token(s): {unknown}. allowed={sorted(allowed)}")
 
-    # Preserve order but de-duplicate.
     seen: set[str] = set()
     comps: list[str] = []
     for t in tokens:
@@ -102,8 +93,10 @@ class Row:
     n: int
     steps: int
     washout: int
-    max_delay: int
-    ridge: float
+    delays: str
+    update_every: int
+    lam: float
+    delta: float
     seed: int
     input_mode: str
     input_params: str
@@ -123,22 +116,37 @@ class Row:
     state_dim: int
     proj_out_dim: int
     proj_seed: int
-    mc: float
+    mc_online: float
+    r2_by_delay_json: str
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="SORCH Phase2: MC with random projection")
+    ap = argparse.ArgumentParser(description="SORCH Phase2: Online RLS readout on reservoir states")
 
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--washout", type=int, default=800)
-    ap.add_argument("--max-delay", type=int, default=200)
-    ap.add_argument("--ridge", type=float, default=1e-3)
+
+    ap.add_argument(
+        "--delays",
+        type=str,
+        default="1,5,10,20,40,80,120",
+        help="delays (in steps) to reconstruct, e.g. '1,10,20' or '1:120:1'",
+    )
+
+    ap.add_argument(
+        "--update-every",
+        type=int,
+        default=10,
+        help="RLS update interval in steps (e.g., 10 means ~10ms if dt=1ms)",
+    )
+    ap.add_argument("--lam", type=float, default=0.995, help="forgetting factor (0<lam<=1)")
+    ap.add_argument("--delta", type=float, default=1.0, help="Tikhonov regularization (>0)")
 
     ap.add_argument(
         "--preset",
         type=str,
-        default="none",
+        default="convo_spiking",
         choices=["none", "convo", "convo_spiking"],
         help="convenience preset (overrides input-related args; *_spiking also sets neuron defaults)",
     )
@@ -174,14 +182,10 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0, help="reservoir+input seed")
 
     ap.add_argument(
-        "--state-modes",
+        "--state-mode",
         type=str,
-        default="v",
-        help=(
-            "comma-separated state modes for readout input. "
-            "Each mode is a '+'-joined list of signals among {v, spike, u, r, eff}. "
-            "Examples: 'v', 'spike', 'v+spike', 'v+u+r+eff'."
-        ),
+        default="v+spike",
+        help="'+'-joined list among {v, spike, u, r, eff}. Examples: 'v', 'v+spike'",
     )
     ap.add_argument(
         "--state-zscore",
@@ -189,16 +193,19 @@ def main() -> int:
         help="z-score states per feature using the post-(washout+max_delay) window",
     )
 
-    ap.add_argument(
-        "--proj-dims",
-        type=str,
-        default="0,50,100,200",
-        help="projection output dims. include 0 to mean 'no projection'",
-    )
+    ap.add_argument("--proj-out-dim", type=int, default=200, help="0 means 'no projection'")
     ap.add_argument("--proj-seed", type=int, default=0)
 
-    ap.add_argument("--out", type=str, default="outputs/phase2/mc/runs/phase2_mc_project.csv")
+    ap.add_argument("--out", type=str, default="outputs/phase2/rls/runs/phase2_rls_online.csv")
     args = ap.parse_args()
+
+    delays = _parse_list_or_range(args.delays)
+    delays = sorted({int(d) for d in delays if int(d) > 0})
+    if not delays:
+        raise ValueError("delays must include at least one positive integer")
+
+    if int(args.update_every) <= 0:
+        raise ValueError("update-every must be > 0")
 
     if str(args.preset) in {"convo", "convo_spiking"}:
         args.input_mode = "convo"
@@ -213,10 +220,6 @@ def main() -> int:
         args.recurrence_source = "spike"
         args.v_threshold = 0.25
         args.dc_bias = 0.25
-
-    proj_dims = _parse_list_or_range(args.proj_dims)
-    if any(d < 0 for d in proj_dims):
-        raise ValueError("proj dims must be >= 0")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,24 +272,15 @@ def main() -> int:
     )
 
     reservoir = STPReservoir(cfg)
-    state_modes_raw = _parse_state_modes(args.state_modes)
-    state_modes: list[tuple[str, tuple[str, ...]]] = [_parse_state_mode(m) for m in state_modes_raw]
 
-    need: list[str] = []
-    for _, comps in state_modes:
-        need.extend(list(comps))
-    need_set = set(need)
-
-    # Run once and cache all required traces.
-    if need_set.issubset({"v"}):
-        states_v = reservoir.run(u)
-        traces: dict[str, np.ndarray] = {"v": states_v}
+    state_mode, comps = _parse_state_mode(args.state_mode)
+    if set(comps).issubset({"v"}):
+        traces: dict[str, np.ndarray] = {"v": reservoir.run(u)}
     else:
-        order = [k for k in ("v", "spike", "u", "r", "eff") if k in need_set]
+        order = [k for k in ("v", "spike", "u", "r", "eff") if k in set(comps)]
         traces = reservoir.run_traces(u, record=tuple(order))
 
     spike_rate = float(reservoir.last_spike_rate)
-
     if spike_rate <= 0.0 and str(args.recurrence_source) == "spike":
         print(
             "WARNING: spike_rate=0. STP (tauF/tauD/U) won't affect dynamics when recurrence_source='spike'. "
@@ -294,62 +288,83 @@ def main() -> int:
             "or switch --recurrence-source v."
         )
 
-    rows: list[Row] = []
-    for state_mode, comps in state_modes:
-        blocks = [np.asarray(traces[c], dtype=np.float32) for c in comps]
-        states_full = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=1)
-        state_dim = int(states_full.shape[1])
+    blocks = [np.asarray(traces[c], dtype=np.float32) for c in comps]
+    states_full = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=1)
+    state_dim = int(states_full.shape[1])
 
-        if bool(args.state_zscore):
-            states_full = _zscore_states(states_full, start=int(args.washout) + int(args.max_delay))
+    start = int(args.washout) + int(max(delays))
+    if start >= int(args.steps):
+        raise ValueError("T too small for washout+max_delay")
 
-        for out_dim in proj_dims:
-            if int(out_dim) == 0:
-                states = states_full
-            else:
-                rp = RandomProjection(in_dim=int(state_dim), out_dim=int(out_dim), seed=int(args.proj_seed))
-                states = rp.project(states_full)
+    if bool(args.state_zscore):
+        states_full = _zscore_states(states_full, start=start)
 
-            mc_res = memory_capacity(
-                states,
-                u,
-                washout=int(args.washout),
-                max_delay=int(args.max_delay),
-                ridge=float(args.ridge),
-            )
+    if int(args.proj_out_dim) == 0:
+        states = states_full
+    else:
+        rp = RandomProjection(in_dim=int(state_dim), out_dim=int(args.proj_out_dim), seed=int(args.proj_seed))
+        states = rp.project(states_full)
 
-            rows.append(
-                Row(
-                    n=int(cfg.n),
-                    steps=int(args.steps),
-                    washout=int(args.washout),
-                    max_delay=int(args.max_delay),
-                    ridge=float(args.ridge),
-                    seed=int(args.seed),
-                    input_mode=str(args.input_mode),
-                    input_params=input_params,
-                    input_bias=float(args.input_bias),
-                    U=float(stp.U),
-                    tauF_ms=float(args.tauF_ms),
-                    tauD_ms=float(args.tauD_ms),
-                    w_scale=float(cfg.w_scale),
-                    sparsity=float(cfg.sparsity),
-                    input_scale=float(cfg.input_scale),
-                    recurrence_source=str(cfg.recurrence_source),
-                    v_threshold=float(cfg.v_threshold),
-                    v_reset=float(cfg.v_reset),
-                    dc_bias=float(cfg.dc_bias),
-                    spike_rate=spike_rate,
-                    state_mode=str(state_mode),
-                    state_dim=int(state_dim),
-                    proj_out_dim=int(out_dim),
-                    proj_seed=int(args.proj_seed),
-                    mc=float(mc_res.mc),
-                )
-            )
+    in_dim = int(states.shape[1])
 
-            tag = "full" if int(out_dim) == 0 else f"rp{int(out_dim)}"
-            print(f"{state_mode} {tag}: MC={mc_res.mc:.3f}")
+    # Add bias term to x.
+    rls = RLS(dim=in_dim + 1, out_dim=len(delays), lam=float(args.lam), delta=float(args.delta), dtype=np.float64)
+
+    y_true: list[np.ndarray] = []
+    y_pred: list[np.ndarray] = []
+
+    for t in range(start, int(args.steps)):
+        x = np.asarray(states[t, :], dtype=np.float64)
+        x_aug = np.concatenate([x, np.array([1.0], dtype=np.float64)], axis=0)
+
+        y_t = np.array([u[t - d] for d in delays], dtype=np.float64)
+        y_hat = rls.predict(x_aug).reshape(-1)
+
+        y_true.append(y_t)
+        y_pred.append(y_hat)
+
+        if (t - start) % int(args.update_every) == 0:
+            rls.update(x_aug, y_t)
+
+    Y = np.stack(y_true, axis=0)
+    Yh = np.stack(y_pred, axis=0)
+
+    r2_by_delay: dict[int, float] = {}
+    for i, d in enumerate(delays):
+        r2_by_delay[int(d)] = float(r2_score(Y[:, i], Yh[:, i]))
+
+    mc_online = float(sum(max(0.0, v) for v in r2_by_delay.values()))
+
+    row = Row(
+        n=int(cfg.n),
+        steps=int(args.steps),
+        washout=int(args.washout),
+        delays=str(args.delays),
+        update_every=int(args.update_every),
+        lam=float(args.lam),
+        delta=float(args.delta),
+        seed=int(args.seed),
+        input_mode=str(args.input_mode),
+        input_params=input_params,
+        input_bias=float(args.input_bias),
+        U=float(stp.U),
+        tauF_ms=float(args.tauF_ms),
+        tauD_ms=float(args.tauD_ms),
+        w_scale=float(cfg.w_scale),
+        sparsity=float(cfg.sparsity),
+        input_scale=float(cfg.input_scale),
+        recurrence_source=str(cfg.recurrence_source),
+        v_threshold=float(cfg.v_threshold),
+        v_reset=float(cfg.v_reset),
+        dc_bias=float(cfg.dc_bias),
+        spike_rate=float(spike_rate),
+        state_mode=str(state_mode),
+        state_dim=int(state_dim),
+        proj_out_dim=int(args.proj_out_dim),
+        proj_seed=int(args.proj_seed),
+        mc_online=float(mc_online),
+        r2_by_delay_json=json.dumps(r2_by_delay, ensure_ascii=False, sort_keys=True),
+    )
 
     fieldnames = list(Row.__annotations__.keys())
     write_header = not out_path.exists()
@@ -357,9 +372,9 @@ def main() -> int:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             w.writeheader()
-        for r in rows:
-            w.writerow({k: getattr(r, k) for k in fieldnames})
+        w.writerow({k: getattr(row, k) for k in fieldnames})
 
+    print(f"{state_mode} online MC={mc_online:.3f} (delays={len(delays)}, update_every={int(args.update_every)})")
     print("Wrote:", out_path)
     return 0
 

@@ -94,8 +94,8 @@ def main() -> int:
         "--preset",
         type=str,
         default="none",
-        choices=["none", "convo"],
-        help="convenience preset (overrides input-related args)",
+        choices=["none", "convo", "convo_spiking"],
+        help="convenience preset (overrides input-related args; *_spiking also sets neuron defaults)",
     )
     ap.add_argument(
         "--input-mode",
@@ -132,10 +132,10 @@ def main() -> int:
     ap.add_argument("--topk", type=int, default=10)
     ap.add_argument("--log-spike-rate", action="store_true")
 
-    ap.add_argument("--out", type=str, default="outputs/phase2_mc_grid.csv")
+    ap.add_argument("--out", type=str, default="outputs/phase2/mc/runs/phase2_mc_grid.csv")
     args = ap.parse_args()
 
-    if str(args.preset) == "convo":
+    if str(args.preset) in {"convo", "convo_spiking"}:
         args.input_mode = "convo"
         args.input_std = 0.6
         args.input_clip = 1.0
@@ -144,6 +144,10 @@ def main() -> int:
         args.tempo_off_min = 80
         args.tempo_off_max = 400
         args.tempo_amp = 1.0
+    if str(args.preset) == "convo_spiking":
+        args.recurrence_source = "spike"
+        args.v_threshold = 0.25
+        args.dc_bias = 0.25
 
     tauF_list = _parse_list_or_range(args.tauF_ms)
     tauD_list = _parse_list_or_range(args.tauD_ms)
@@ -153,6 +157,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows: list[SearchRow] = []
+    warned_no_spikes = False
 
     # Stable input per seed.
     for rep in range(int(args.repeats)):
@@ -208,6 +213,14 @@ def main() -> int:
             res = STPReservoir(cfg)
             states = res.run(u)
             spike_rate = float(res.last_spike_rate)
+
+            if (not warned_no_spikes) and spike_rate <= 0.0 and str(args.recurrence_source) == "spike":
+                print(
+                    "WARNING: spike_rate=0. STP (tauF/tauD/U) won't affect dynamics when recurrence_source='spike'. "
+                    "Try --preset convo_spiking, or lower --v-threshold / raise --dc-bias / raise --input-scale, "
+                    "or switch --recurrence-source v."
+                )
+                warned_no_spikes = True
             mc_res = memory_capacity(
                 states,
                 u,

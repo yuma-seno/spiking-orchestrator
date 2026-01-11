@@ -5,11 +5,16 @@ import csv
 from dataclasses import dataclass
 import math
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
 class Row:
     stage: str | None
+    proj_out_dim: int | None
+    proj_seed: int | None
+    state_mode: str | None
+    state_dim: int | None
     tauF_ms: float
     tauD_ms: float
     w_scale: float
@@ -42,9 +47,22 @@ def _load_rows(path: Path) -> list[Row]:
             stage = _get(r, "stage") or None
             spike_rate_s = _get(r, "spike_rate", "")
             spike_rate = float(spike_rate_s) if spike_rate_s != "" else None
+
+            proj_out_dim_s = _get(r, "proj_out_dim", "")
+            proj_out_dim = int(float(proj_out_dim_s)) if proj_out_dim_s != "" else None
+            proj_seed_s = _get(r, "proj_seed", "")
+            proj_seed = int(float(proj_seed_s)) if proj_seed_s != "" else None
+
+            state_mode = _get(r, "state_mode", "") or None
+            state_dim_s = _get(r, "state_dim", "")
+            state_dim = int(float(state_dim_s)) if state_dim_s != "" else None
             rows.append(
                 Row(
                     stage=stage,
+                    proj_out_dim=proj_out_dim,
+                    proj_seed=proj_seed,
+                    state_mode=state_mode,
+                    state_dim=state_dim,
                     tauF_ms=float(_get(r, "tauF_ms", "0")),
                     tauD_ms=float(_get(r, "tauD_ms", "0")),
                     w_scale=float(_get(r, "w_scale", "0")),
@@ -82,29 +100,44 @@ def generate_report_markdown(csv_path: Path, topk: int = 10) -> str:
     uniq_sparsity = sorted({r.sparsity for r in rows})
 
     has_spike_rate = any(r.spike_rate is not None and not math.isnan(r.spike_rate) for r in rows)
+    has_projection = any(r.proj_out_dim is not None for r in rows)
+    uniq_proj_dims = sorted({r.proj_out_dim for r in rows if r.proj_out_dim is not None})
+
+    has_state = any(r.state_mode is not None for r in rows)
+    uniq_state_modes = sorted({r.state_mode for r in rows if r.state_mode is not None})
 
     # Aggregate by parameter tuple (ignoring seed/stage)
-    buckets_mc: dict[tuple[float, float, float, float, str, float, float, float, float], list[float]] = {}
-    buckets_sr: dict[tuple[float, float, float, float, str, float, float, float, float], list[float]] = {}
+    key_type = tuple[Any, ...]
+    buckets_mc: dict[key_type, list[float]] = {}
+    buckets_sr: dict[key_type, list[float]] = {}
+
     for r in rows:
-        key = (
-            r.tauF_ms,
-            r.tauD_ms,
-            r.w_scale,
-            r.U,
-            r.recurrence_source,
-            r.v_threshold,
-            r.input_scale,
-            r.input_bias,
-            r.dc_bias,
+        key_parts: list[Any] = []
+        if has_projection:
+            key_parts.extend([int(r.proj_out_dim or 0), int(r.proj_seed or 0)])
+        if has_state:
+            key_parts.extend([str(r.state_mode or ""), int(r.state_dim or 0)])
+
+        key_parts.extend(
+            [
+                r.tauF_ms,
+                r.tauD_ms,
+                r.w_scale,
+                r.U,
+                r.recurrence_source,
+                r.v_threshold,
+                r.input_scale,
+                r.input_bias,
+                r.dc_bias,
+            ]
         )
+
+        key = tuple(key_parts)
         buckets_mc.setdefault(key, []).append(r.mc)
         if r.spike_rate is not None and not math.isnan(r.spike_rate):
             buckets_sr.setdefault(key, []).append(r.spike_rate)
 
-    scored: list[
-        tuple[float, float, int, float | None, tuple[float, float, float, float, str, float, float, float, float]]
-    ] = []
+    scored: list[tuple[float, float, int, float | None, key_type]] = []
     for key, mcs in buckets_mc.items():
         mean = sum(mcs) / len(mcs)
         # naive std
@@ -155,6 +188,10 @@ def generate_report_markdown(csv_path: Path, topk: int = 10) -> str:
     lines.append(f"- max_delay: {_fmt_list(uniq_max_delay)}（何ステップ前まで復元するか）")
     lines.append(f"- ridge（回帰の正則化）: {_fmt_list(uniq_ridge)}")
     lines.append(f"- sparsity（結合の疎さ）: {_fmt_list(uniq_sparsity)}")
+    if has_projection:
+        lines.append(f"- Random Projection out_dim（0=full）: {_fmt_list([int(x) for x in uniq_proj_dims])}")
+    if has_state:
+        lines.append(f"- state_mode: {_fmt_list([str(x) for x in uniq_state_modes])}")
     lines.append("")
 
     if has_spike_rate:
@@ -176,41 +213,100 @@ def generate_report_markdown(csv_path: Path, topk: int = 10) -> str:
     lines.append("- **n_runs**: 平均を取った回数")
     if has_spike_rate:
         lines.append("- **mean spike_rate**: 同じ条件の平均発火率（0に近い場合は要注意）")
+    if has_projection:
+        lines.append("- **proj_out_dim**: Random Projectionの出力次元（0は投影なし/full）")
+    if has_state:
+        lines.append("- **state_mode**: readoutに渡す状態ベクトルの種類")
     lines.append("")
 
+    # Build markdown table header dynamically (keeps backward compatibility)
+    cols: list[str] = ["rank", "mean MC", "std", "n_runs"]
+    aligns: list[str] = ["---:", "---:", "---:", "---:"]
     if has_spike_rate:
-        lines.append(
-            "| rank | mean MC | std | n_runs | mean spike_rate | tauF_ms | tauD_ms | w_scale | U | rec | v_th | in_scale | in_bias | dc_bias |"
-        )
-        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|:--|---:|---:|---:|---:|")
-    else:
-        lines.append(
-            "| rank | mean MC | std | n_runs | tauF_ms | tauD_ms | w_scale | U | rec | v_th | in_scale | in_bias | dc_bias |"
-        )
-        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|:--|---:|---:|---:|---:|")
+        cols.append("mean spike_rate")
+        aligns.append("---:")
+    if has_projection:
+        cols.append("proj_out_dim")
+        aligns.append("---:")
+    if has_state:
+        cols.append("state_mode")
+        aligns.append(":--")
+    cols.extend(["tauF_ms", "tauD_ms", "w_scale", "U", "rec", "v_th", "in_scale", "in_bias", "dc_bias"])
+    aligns.extend(["---:", "---:", "---:", "---:", ":--", "---:", "---:", "---:", "---:"])
+    lines.append("| " + " | ".join(cols) + " |")
+    lines.append("|" + "|".join(aligns) + "|")
 
     topk = min(int(topk), len(scored))
     for i in range(topk):
         mean, std, n_runs, mean_sr, key = scored[i]
-        tauF_ms, tauD_ms, w_scale, U, rec, v_th, in_scale, in_bias, dc_bias = key
+        idx = 0
+        proj_out_dim = None
+        proj_seed = None
+        state_mode = None
+        state_dim = None
+        if has_projection:
+            proj_out_dim = int(key[idx])
+            proj_seed = int(key[idx + 1])
+            idx += 2
+        if has_state:
+            state_mode = str(key[idx])
+            state_dim = int(key[idx + 1])
+            idx += 2
+
+        tauF_ms, tauD_ms, w_scale, U, rec, v_th, in_scale, in_bias, dc_bias = key[idx:]
+
+        row_cells: list[str] = [
+            str(i + 1),
+            f"{mean:.4f}",
+            f"{std:.4f}",
+            str(n_runs),
+        ]
         if has_spike_rate:
-            sr_s = "" if mean_sr is None else f"{mean_sr:.6f}"
-            lines.append(
-                f"| {i+1} | {mean:.4f} | {std:.4f} | {n_runs} | {sr_s} | {tauF_ms:.0f} | {tauD_ms:.0f} | {w_scale:.3f} | {U:.3f} | {rec} | {v_th:.3f} | {in_scale:.3f} | {in_bias:.3f} | {dc_bias:.3f} |"
-            )
-        else:
-            lines.append(
-                f"| {i+1} | {mean:.4f} | {std:.4f} | {n_runs} | {tauF_ms:.0f} | {tauD_ms:.0f} | {w_scale:.3f} | {U:.3f} | {rec} | {v_th:.3f} | {in_scale:.3f} | {in_bias:.3f} | {dc_bias:.3f} |"
-            )
+            row_cells.append("" if mean_sr is None else f"{mean_sr:.6f}")
+        if has_projection:
+            row_cells.append(str(int(proj_out_dim or 0)))
+        if has_state:
+            row_cells.append(str(state_mode or ""))
+        row_cells.extend(
+            [
+                f"{float(tauF_ms):.0f}",
+                f"{float(tauD_ms):.0f}",
+                f"{float(w_scale):.3f}",
+                f"{float(U):.3f}",
+                str(rec),
+                f"{float(v_th):.3f}",
+                f"{float(in_scale):.3f}",
+                f"{float(in_bias):.3f}",
+                f"{float(dc_bias):.3f}",
+            ]
+        )
+        lines.append("| " + " | ".join(row_cells) + " |")
 
     lines.append("")
     best_mean, best_std, best_n, best_sr, best_key = scored[0]
-    tauF_ms, tauD_ms, w_scale, U, rec, v_th, in_scale, in_bias, dc_bias = best_key
+    idx = 0
+    best_proj_out_dim = None
+    best_proj_seed = None
+    best_state_mode = None
+    best_state_dim = None
+    if has_projection:
+        best_proj_out_dim = int(best_key[idx])
+        best_proj_seed = int(best_key[idx + 1])
+        idx += 2
+    if has_state:
+        best_state_mode = str(best_key[idx])
+        best_state_dim = int(best_key[idx + 1])
+        idx += 2
+    tauF_ms, tauD_ms, w_scale, U, rec, v_th, in_scale, in_bias, dc_bias = best_key[idx:]
     lines.append("## Best")
     lines.append("")
     lines.append(f"- mean MC={best_mean:.4f} (std={best_std:.4f}, n_runs={best_n})")
     if has_spike_rate and best_sr is not None:
         lines.append(f"- mean spike_rate={best_sr:.6f}")
+    if has_projection:
+        lines.append(f"- proj_out_dim={int(best_proj_out_dim or 0)} (proj_seed={int(best_proj_seed or 0)})")
+    if has_state:
+        lines.append(f"- state_mode={best_state_mode} (state_dim={int(best_state_dim or 0)})")
     lines.append(f"- tauF={tauF_ms:.0f}ms, tauD={tauD_ms:.0f}ms, w_scale={w_scale:.3f}, U={U:.3f}")
     lines.append(f"- rec={rec}, v_threshold={v_th:.3f}")
     lines.append(f"- input_scale={in_scale:.3f}, input_bias={in_bias:.3f}, dc_bias={dc_bias:.3f}")
@@ -241,7 +337,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Summarize Phase2 MC CSV and produce a markdown report")
     ap.add_argument("--csv", type=str, required=True)
     ap.add_argument("--topk", type=int, default=10)
-    ap.add_argument("--out", type=str, default="outputs/phase2_mc_report.md")
+    ap.add_argument("--out", type=str, default="outputs/phase2/mc/reports/phase2_mc_report.md")
     args = ap.parse_args()
 
     csv_path = Path(args.csv)

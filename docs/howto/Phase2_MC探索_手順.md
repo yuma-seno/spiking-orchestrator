@@ -7,9 +7,16 @@
 - STPリザーバの **Memory Capacity (MC)** を計測する
 - $\tau_F, \tau_D, W_{scale}$ を探索し、短期記憶性能を最大化する
 
+用語:
+- STP: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-stp)
+- MC: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-mc)
+
 ## 実行（単発）
 スモール設定（まず動作確認）:
 - `python -m sorch.bench.mc_sweep --n 200 --steps 5000 --washout 500 --max-delay 200 --tauF-ms 200 --tauD-ms 1000 --w-scale 1.0 --out outputs/phase2/mc/runs/phase2_mc.csv`
+
+convo入力（疑似会話テンポ）で、かつ **発火を出したい** とき（STP差を見やすくする）:
+- `python -m sorch.bench.mc_sweep --preset convo_spiking --n 200 --steps 5000 --washout 500 --max-delay 200 --tauF-ms 200 --tauD-ms 1000 --w-scale 1.0 --out outputs/phase2/mc/runs/phase2_mc_convo_spiking.csv`
 
 より短いスモーク（まずMCが0張り付きでないことを確認）:
 - `python -m sorch.bench.mc_sweep --n 50 --steps 2000 --washout 200 --max-delay 50 --tauF-ms 200 --tauD-ms 1000 --w-scale 1.0 --out outputs/phase2/mc/runs/phase2_mc_smoke.csv`
@@ -57,6 +64,72 @@
 - まとめて再生成（おすすめ・丁寧版の統一）:
   - `python -m sorch.bench.mc_report_all --overwrite --topk 15`
 
+---
+
+## Step 2.3（Readout/次元削減）: 状態ベクトル設計（state_mode）
+
+`mc_sweep` / `mc_search` / `mc_refine` は基本的に状態として膜電位 `v` を使いますが、
+Readoutに渡す状態ベクトルを **spike** や **STP内部状態（u/r/eff）** まで含めると、
+MCが大きく伸びることがあります（その分、次元が増えるため Random Projection とセットで検討します）。
+
+先に用語だけ押さえる（おすすめ）:
+- state_mode（状態ベクトルの選び方）: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-state-mode)
+- 状態ベクトル（state vector）: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-state-vector)
+- Random Projection: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-random-projection)
+- washout: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-washout)
+- max_delay: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-max-delay)
+- ridge: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-ridge)
+- spike_rate: [用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-spike-rate)
+
+### 状態ベクトルを切り替えて比較する（おすすめ）
+- スモーク（seed=0、投影なし）:
+  - `python -m sorch.bench.mc_project --preset convo_spiking --n 120 --steps 3000 --washout 300 --max-delay 120 --seed 0 \
+      --proj-dims 0 \
+      --state-modes 'v,spike,v+spike,v+u+r+eff,v+spike+u+r+eff' \
+    --out outputs/phase2/mc/runs/phase2_mc_state_modes_smoke.csv`
+
+- repeats（seed=0..4の例）:
+  - `for s in 0 1 2 3 4; do python -m sorch.bench.mc_project --preset convo_spiking --n 120 --steps 3000 --washout 300 --max-delay 120 --seed $s \
+      --proj-dims 0 \
+      --state-modes 'v,spike,v+spike,v+u+r+eff,v+spike+u+r+eff' \
+    --out outputs/phase2/mc/runs/phase2_mc_state_modes_smoke.csv; done`
+
+### 次元削減とセットで確認する（例）
+状態次元が大きい（例: `v+spike+u+r+eff` は `5*n`）ときは、
+投影しても性能が維持できるかを確認します。
+
+見方（超ざっくり）:
+- `state_mode` を足すほど次元（=計算コスト）は増えるが、MCは伸びやすい
+- `proj_out_dim` を小さくするほど軽くなるが、MCは落ちやすい
+- まず「投影なし（0）」で state_mode を決め、次に投影でどこまで落ちるかを見る
+
+- 例（投影なし=0 と out_dim=200 を比較）:
+  - `python -m sorch.bench.mc_project --preset convo_spiking --n 120 --steps 3000 --washout 300 --max-delay 120 --seed 0 \
+      --proj-dims 0,200 \
+      --state-modes 'v+spike+u+r+eff' \
+    --out outputs/phase2/mc/runs/phase2_mc_state_mode_project.csv`
+
+### どれを採用する？（判断の目安）
+まずは **「投影あり（軽い）前提」**か **「投影なし（強い）前提」**かを決めるのがおすすめです。
+
+- 投影なし（`proj_out_dim=0`）で最強を狙う → `v+spike+u+r+eff` が強い傾向
+- `proj_out_dim=200` で“現実に軽くする” → `v+spike` が強い傾向（state_dimが小さく、圧縮率が低い）
+
+参考（repeats5レポート）:
+- state_mode単体比較: [outputs/phase2/mc/reports/phase2_mc_state_modes_smoke_report.md](../../outputs/phase2/mc/reports/phase2_mc_state_modes_smoke_report.md)
+- state_mode×投影（0/100/200）比較: [outputs/phase2/mc/reports/phase2_mc_state_modes_project_repeats5_report.md](../../outputs/phase2/mc/reports/phase2_mc_state_modes_project_repeats5_report.md)
+
+注意:
+- `proj_out_dim=100` は今回の条件では大きく劣化しやすい
+- `--state-zscore` は実験用（今回の条件ではfull側のばらつきが大きく、採用は見送り）
+
+### レポート化
+- `python -m sorch.bench.mc_report --csv outputs/phase2/mc/runs/phase2_mc_state_modes_smoke.csv \
+    --out outputs/phase2/mc/reports/phase2_mc_state_modes_smoke_report.md`
+
 ## 注意（よくあるつまずき）
 - `spike_rate=0`（発火しない）と、STPパラメータ差がMCに反映されにくい
-  - 対策: `--v-threshold` を下げる / `--input-bias` を付ける / `--dc-bias` で定常電流を入れる
+  - 用語: spike_rate（[用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-spike-rate)）
+  - まずは `--preset convo_spiking` を試す（`v_threshold=0.25`, `dc_bias=0.25` を自動セット）
+  - それでも0なら: `--v-threshold 0.25` 付近まで下げる / `--dc-bias 0.25` 付近まで上げる / `--input-scale` を上げる
+  - どうしてもスパイクが死にやすいとき: `--recurrence-source v`（スパイクではなく膜電位で再帰させる）

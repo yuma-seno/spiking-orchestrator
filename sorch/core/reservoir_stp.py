@@ -112,3 +112,50 @@ class STPReservoir:
             total_spikes += float(self._s.sum().cpu().item())
         self.last_spike_rate = total_spikes / float(max(1, u.size * self.cfg.n))
         return states
+
+    @torch.no_grad()
+    def run_traces(self, u: np.ndarray, *, record: tuple[str, ...] = ("v",)) -> dict[str, np.ndarray]:
+        """Run the reservoir and record requested internal traces.
+
+        Supported trace names:
+        - "v": membrane potential (T, N)
+        - "spike": output spikes (T, N)
+        - "u": STP utilization state (T, N)
+        - "r": STP resources state (T, N)
+        - "eff": STP efficacy u*r clamped to [0, 1] (T, N)
+        """
+
+        allowed = {"v", "spike", "u", "r", "eff"}
+        unknown = [k for k in record if k not in allowed]
+        if unknown:
+            raise ValueError(f"unknown trace(s): {unknown}. allowed={sorted(allowed)}")
+
+        self.reset()
+        u = np.asarray(u).reshape(-1)
+        T = int(u.size)
+
+        out: dict[str, np.ndarray] = {}
+        for k in record:
+            out[k] = np.zeros((T, self.cfg.n), dtype=np.float32)
+
+        total_spikes = 0.0
+        for t in range(T):
+            _ = self.step(float(u[t]))
+            total_spikes += float(self._s.sum().cpu().item())
+
+            if "v" in out:
+                out["v"][t, :] = self._v.cpu().numpy()
+            if "spike" in out:
+                out["spike"][t, :] = self._s.cpu().numpy()
+            if ("u" in out) or ("r" in out) or ("eff" in out):
+                assert self.node.u is not None and self.node.r is not None
+                if "u" in out:
+                    out["u"][t, :] = self.node.u.to(torch.float32).cpu().numpy()
+                if "r" in out:
+                    out["r"][t, :] = self.node.r.to(torch.float32).cpu().numpy()
+                if "eff" in out:
+                    eff = (self.node.u * self.node.r).clamp(min=0.0, max=1.0)
+                    out["eff"][t, :] = eff.to(torch.float32).cpu().numpy()
+
+        self.last_spike_rate = total_spikes / float(max(1, T * self.cfg.n))
+        return out
