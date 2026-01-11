@@ -133,3 +133,35 @@ MCが大きく伸びることがあります（その分、次元が増えるた
   - まずは `--preset convo_spiking` を試す（`v_threshold=0.25`, `dc_bias=0.25` を自動セット）
   - それでも0なら: `--v-threshold 0.25` 付近まで下げる / `--dc-bias 0.25` 付近まで上げる / `--input-scale` を上げる
   - どうしてもスパイクが死にやすいとき: `--recurrence-source v`（スパイクではなく膜電位で再帰させる）
+
+---
+
+## Step 2.4（オンライン学習）: RLSでreadoutを更新する
+
+ここでは、Readout重みを **RLS**（[用語集](../project/%E7%94%A8%E8%AA%9E%E9%9B%86.md#glossary-rls)）でオンライン更新し、
+「少数の遅延（delays）について過去入力の復元が維持できるか」をスモークで確認します。
+
+前提:
+- Step 2.3 の暫定推奨（軽さ優先）: `state_mode=v+spike` + `proj_out_dim=200`
+
+### スモーク（seed=0）
+- `python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed 0 \
+    --state-mode v+spike --proj-out-dim 200 \
+    --delays 1,5,10,20,40,80,120 \
+    --update-every 10 --lam 0.995 --delta 1.0 \
+  --out outputs/phase2/rls/runs/phase2_rls_online_smoke.csv`
+
+### repeats（seed=0..4 の例）
+- `for s in 0 1 2 3 4; do python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed $s \
+    --state-mode v+spike --proj-out-dim 200 \
+    --delays 1,5,10,20,40,80,120 \
+    --update-every 10 --lam 0.995 --delta 1.0 \
+  --out outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv; done`
+
+### 出力の見方（ざっくり）
+- `mc_online`: delay別のR^2を足し合わせた指標（負のR^2は0扱い）
+- `r2_by_delay_json`: delayごとのR^2（JSON）
+
+出力場所:
+- 生データ（CSV）: [outputs/phase2/rls/runs/](../../outputs/phase2/rls/runs/)
+
