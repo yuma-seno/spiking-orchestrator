@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -30,6 +31,20 @@ class Phase3StopEvent:
     reason: str
 
 
+def _open_pyaudio():
+    # PortAudio tends to try JACK first; in containers that often spews logs.
+    os.environ.setdefault("JACK_NO_START_SERVER", "1")
+    try:
+        import pyaudio  # type: ignore
+
+        return pyaudio
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "PyAudio の import に失敗しました。requirements のインストール完了と、"
+            "システム側の PortAudio 依存（portaudio19-dev 等）が揃っているか確認してください。"
+        ) from e
+
+
 def _audio_proc(
     *,
     feat_ring: SpscRingHandle,
@@ -37,45 +52,104 @@ def _audio_proc(
     seconds: float,
     sample_rate: int,
     frames: int,
+    input_device: int | None,
+    input_channels: int,
+    dry_run: bool,
 ) -> None:
     ring = SharedSpscRing.attach(feat_ring)
 
     t_end = time.perf_counter() + float(seconds)
-    seq = 0
-    dropped = 0
-
-    dt_s = float(frames) / float(sample_rate)
 
     try:
-        while (not shutdown_event.is_set()) and (time.perf_counter() < t_end):
-            # synthetic: mostly silence with occasional voiced burst
-            if (seq % 200) == 120:
-                t = np.arange(frames, dtype=np.float32) / float(sample_rate)
-                frame = 0.2 * np.sin(2.0 * np.pi * 220.0 * t).astype(np.float32)
-            else:
-                frame = (0.001 * np.random.randn(frames)).astype(np.float32)
+        if dry_run:
+            seq = 0
+            dt_s = float(frames) / float(sample_rate)
+            while (not shutdown_event.is_set()) and (time.perf_counter() < t_end):
+                # synthetic: mostly silence with occasional voiced burst
+                if (seq % 200) == 120:
+                    t = np.arange(frames, dtype=np.float32) / float(sample_rate)
+                    frame = 0.2 * np.sin(2.0 * np.pi * 220.0 * t).astype(np.float32)
+                else:
+                    frame = (0.001 * np.random.randn(frames)).astype(np.float32)
 
-            t_read_done_ns = time.perf_counter_ns()
-            feats = compute_features(frame, sample_rate)
-            t_feat_done_ns = time.perf_counter_ns()
+                t_read_done_ns = time.perf_counter_ns()
+                feats = compute_features(frame, sample_rate)
+                t_feat_done_ns = time.perf_counter_ns()
 
-            msg = np.array(
-                [
-                    float(t_read_done_ns),
-                    float(t_feat_done_ns),
-                    float(feats.rms),
-                    float(feats.zcr),
-                    float(feats.spectral_centroid_hz),
-                    1.0 if feats.voicing else 0.0,
-                ],
-                dtype=np.float64,
+                msg = np.array(
+                    [
+                        float(t_read_done_ns),
+                        float(t_feat_done_ns),
+                        float(feats.rms),
+                        float(feats.zcr),
+                        float(feats.spectral_centroid_hz),
+                        1.0 if feats.voicing else 0.0,
+                    ],
+                    dtype=np.float64,
+                )
+                _ = ring.push(msg)
+
+                seq += 1
+                time.sleep(dt_s)
+            return
+
+        pyaudio = _open_pyaudio()
+        pa = pyaudio.PyAudio()
+        try:
+            input_stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=int(input_channels),
+                rate=int(sample_rate),
+                input=True,
+                frames_per_buffer=int(frames),
+                input_device_index=input_device,
+                start=True,
             )
+        except Exception as e:  # noqa: BLE001
+            pa.terminate()
+            raise RuntimeError(
+                "オーディオ入力（マイク）のオープンに失敗しました。\n"
+                "- まず `--list-devices` で index を確認\n"
+                "- コンテナ内で /dev/snd が見えているか確認\n"
+            ) from e
 
-            if not ring.push(msg):
-                dropped += 1
+        try:
+            while (not shutdown_event.is_set()) and (time.perf_counter() < t_end):
+                data = input_stream.read(int(frames), exception_on_overflow=False)
+                t_read_done_ns = time.perf_counter_ns()
 
-            seq += 1
-            time.sleep(dt_s)
+                x = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+                if int(input_channels) > 1:
+                    x = x.reshape(-1, int(input_channels)).mean(axis=1)
+                frame = x / 32768.0
+
+                feats = compute_features(frame, int(sample_rate))
+                t_feat_done_ns = time.perf_counter_ns()
+
+                msg = np.array(
+                    [
+                        float(t_read_done_ns),
+                        float(t_feat_done_ns),
+                        float(feats.rms),
+                        float(feats.zcr),
+                        float(feats.spectral_centroid_hz),
+                        1.0 if feats.voicing else 0.0,
+                    ],
+                    dtype=np.float64,
+                )
+                # best-effort: if core lags, drop newest frames
+                _ = ring.push(msg)
+
+        finally:
+            try:
+                input_stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                input_stream.close()
+            except Exception:
+                pass
+            pa.terminate()
     finally:
         ring.close()
 
@@ -143,7 +217,22 @@ def _core_proc(
         stop_rb.close()
 
 
-def _motor_proc(*, stop_ring: SpscRingHandle, shutdown_event, out_jsonl: str) -> None:
+def _motor_proc(
+    *,
+    stop_ring: SpscRingHandle,
+    shutdown_event,
+    out_jsonl: str,
+    seconds: float,
+    sample_rate: int,
+    frames: int,
+    output_device: int | None,
+    output_channels: int,
+    output_mode: str,
+    output_gain: float,
+    tone_hz: float,
+    resume_after_ms: float,
+    dry_run: bool,
+) -> None:
     stop_rb = SharedSpscRing.attach(stop_ring)
 
     out_path = Path(out_jsonl)
@@ -151,17 +240,83 @@ def _motor_proc(*, stop_ring: SpscRingHandle, shutdown_event, out_jsonl: str) ->
 
     seq = 0
 
+    output_stream = None
+    pa = None
+    out_buf = b""
+
+    t_end = time.perf_counter() + float(seconds)
+    last_resume_ns = 0
+
     try:
+        if not dry_run:
+            pyaudio = _open_pyaudio()
+            pa = pyaudio.PyAudio()
+
+            out_frames = int(frames)
+            gain = float(max(0.0, min(1.0, float(output_gain))))
+            ch = int(output_channels)
+
+            if output_mode == "silence":
+                out_buf = (np.zeros((out_frames, ch), dtype=np.float32)).tobytes()
+            elif output_mode == "noise":
+                out_buf = (gain * np.random.randn(out_frames, ch).astype(np.float32)).tobytes()
+            elif output_mode == "tone":
+                t = np.arange(out_frames, dtype=np.float32) / float(sample_rate)
+                wave = gain * np.sin(2.0 * np.pi * float(tone_hz) * t).astype(np.float32)
+                if ch == 1:
+                    out_buf = wave.tobytes()
+                else:
+                    out_buf = np.repeat(wave[:, None], repeats=ch, axis=1).tobytes()
+            else:
+                out_buf = b""
+
+            if output_mode != "off":
+                try:
+                    output_stream = pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=ch,
+                        rate=int(sample_rate),
+                        output=True,
+                        frames_per_buffer=out_frames,
+                        output_device_index=output_device,
+                        start=True,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    pa.terminate()
+                    raise RuntimeError(
+                        "オーディオ出力（スピーカー）のオープンに失敗しました。\n"
+                        "- まず `--list-devices` で index を確認\n"
+                        "- コンテナ内で /dev/snd が見えているか確認\n"
+                    ) from e
+
+                # Prime output so stop has something to stop.
+                for _ in range(10):
+                    output_stream.write(out_buf)
+
         with out_path.open("w", encoding="utf-8") as f:
-            while not shutdown_event.is_set():
+            while (not shutdown_event.is_set()) and (time.perf_counter() < t_end):
+                if output_stream is not None and out_buf:
+                    if output_stream.is_active():
+                        output_stream.write(out_buf)
+                    else:
+                        if last_resume_ns and (time.perf_counter_ns() - last_resume_ns) >= int(resume_after_ms * 1e6):
+                            output_stream.start_stream()
+                            last_resume_ns = 0
+
                 msg = stop_rb.pop()
                 if msg is None:
                     time.sleep(0.0002)
                     continue
 
-                t_stop_done_ns = time.perf_counter_ns()
-                seq += 1
+                # Hard Stop path: stop stream first, then timestamp.
+                if output_stream is not None and output_stream.is_active():
+                    output_stream.stop_stream()
+                    t_stop_done_ns = time.perf_counter_ns()
+                    last_resume_ns = t_stop_done_ns
+                else:
+                    t_stop_done_ns = time.perf_counter_ns()
 
+                seq += 1
                 ev = Phase3StopEvent(
                     seq=seq,
                     t_read_done_ns=int(msg[0]),
@@ -179,17 +334,62 @@ def _motor_proc(*, stop_ring: SpscRingHandle, shutdown_event, out_jsonl: str) ->
                 f.write(json.dumps(asdict(ev), ensure_ascii=False) + "\n")
                 f.flush()
     finally:
+        try:
+            if output_stream is not None:
+                try:
+                    output_stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    output_stream.close()
+                except Exception:
+                    pass
+        finally:
+            if pa is not None:
+                pa.terminate()
         stop_rb.close()
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="SORCH Phase3 multiprocess dry-run demo")
+    ap = argparse.ArgumentParser(description="SORCH Phase3 multiprocess demo (mic->core->motor stop)")
     ap.add_argument("--seconds", type=float, default=10.0)
     ap.add_argument("--sample-rate", type=int, default=48000)
     ap.add_argument("--frames", type=int, default=256)
+    ap.add_argument("--input-device", type=int, default=None, help="PyAudio input device index")
+    ap.add_argument("--output-device", type=int, default=None, help="PyAudio output device index")
+    ap.add_argument("--input-channels", type=int, default=1)
+    ap.add_argument("--output-channels", type=int, default=1)
+    ap.add_argument(
+        "--output-mode",
+        type=str,
+        default="silence",
+        choices=["silence", "noise", "tone", "off"],
+        help="speaker output content: silence/noise/tone/off",
+    )
+    ap.add_argument("--output-gain", type=float, default=0.0, help="0.0..1.0 (use small values)")
+    ap.add_argument("--tone-hz", type=float, default=220.0)
+    ap.add_argument("--resume-after-ms", type=float, default=500.0)
     ap.add_argument("--holdoff-ms", type=float, default=300.0)
     ap.add_argument("--output", type=str, default="outputs/phase3/stop_events.jsonl")
+    ap.add_argument("--list-devices", action="store_true", help="print PyAudio device list and exit")
+    ap.add_argument("--dry-run", action="store_true", help="no audio devices; synthetic input and no output")
     args = ap.parse_args()
+
+    if not args.dry_run and args.list_devices:
+        pyaudio = _open_pyaudio()
+        pa = pyaudio.PyAudio()
+        try:
+            for i in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(i)
+                name = info.get("name", "")
+                max_in = int(info.get("maxInputChannels", 0))
+                max_out = int(info.get("maxOutputChannels", 0))
+                default_sr = info.get("defaultSampleRate", "?")
+                host_api = info.get("hostApi", "?")
+                print(f"[{i}] in={max_in} out={max_out} sr={default_sr} hostApi={host_api} name={name}")
+        finally:
+            pa.terminate()
+        return 0
 
     dt_ms = (int(args.frames) / int(args.sample_rate)) * 1000.0
 
@@ -210,6 +410,9 @@ def main() -> int:
                 seconds=float(args.seconds),
                 sample_rate=int(args.sample_rate),
                 frames=int(args.frames),
+                input_device=args.input_device,
+                input_channels=int(args.input_channels),
+                dry_run=bool(args.dry_run),
             ),
             name="audio",
             daemon=True,
@@ -232,6 +435,16 @@ def main() -> int:
                 stop_ring=stop_rb.handle(),
                 shutdown_event=shutdown_event,
                 out_jsonl=str(args.output),
+                seconds=float(args.seconds),
+                sample_rate=int(args.sample_rate),
+                frames=int(args.frames),
+                output_device=args.output_device,
+                output_channels=int(args.output_channels),
+                output_mode=str(args.output_mode),
+                output_gain=float(args.output_gain),
+                tone_hz=float(args.tone_hz),
+                resume_after_ms=float(args.resume_after_ms),
+                dry_run=bool(args.dry_run),
             ),
             name="motor",
             daemon=True,
