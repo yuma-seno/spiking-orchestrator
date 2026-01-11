@@ -148,15 +148,21 @@ MCが大きく伸びることがあります（その分、次元が増えるた
 - `python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed 0 \
     --state-mode v+spike --proj-out-dim 200 \
     --delays 1,5,10,20,40,80,120 \
-    --update-every 10 --lam 0.995 --delta 1.0 \
   --out outputs/phase2/rls/runs/phase2_rls_online_smoke.csv`
 
 ### repeats（seed=0..4 の例）
 - `for s in 0 1 2 3 4; do python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed $s \
     --state-mode v+spike --proj-out-dim 200 \
     --delays 1,5,10,20,40,80,120 \
-    --update-every 10 --lam 0.995 --delta 1.0 \
   --out outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv; done`
+
+補足:
+- `rls_online` のデフォルト（推奨）: `--update-every 1 --lam 1.0 --delta 0.01`
+  - `update_every>1` だと今回の条件では R^2 が負に崩れて `mc_online=0` になりやすい
+
+### レポート化
+- `python -m sorch.bench.rls_report --csv outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv \
+    --out outputs/phase2/rls/reports/phase2_rls_online_repeats5_report.md`
 
 ### 出力の見方（ざっくり）
 - `mc_online`: delay別のR^2を足し合わせた指標（負のR^2は0扱い）

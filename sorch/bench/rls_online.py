@@ -118,6 +118,9 @@ class Row:
     proj_seed: int
     mc_online: float
     r2_by_delay_json: str
+    nan_pred_frac: float
+    nan_W: int
+    w_norm: float
 
 
 def main() -> int:
@@ -137,11 +140,21 @@ def main() -> int:
     ap.add_argument(
         "--update-every",
         type=int,
-        default=10,
-        help="RLS update interval in steps (e.g., 10 means ~10ms if dt=1ms)",
+        default=1,
+        help="RLS update interval in steps (this benchmark typically needs 1)",
     )
-    ap.add_argument("--lam", type=float, default=0.995, help="forgetting factor (0<lam<=1)")
-    ap.add_argument("--delta", type=float, default=1.0, help="Tikhonov regularization (>0)")
+    ap.add_argument(
+        "--train-frac",
+        type=float,
+        default=1.0,
+        help=(
+            "fraction of post-(washout+max_delay) window used for RLS updates. "
+            "mc_online is computed by evaluating the final weights on the same training window "
+            "(consistent with standard MC ridge evaluation)."
+        ),
+    )
+    ap.add_argument("--lam", type=float, default=1.0, help="forgetting factor (0<lam<=1)")
+    ap.add_argument("--delta", type=float, default=0.01, help="Tikhonov regularization (>0)")
 
     ap.add_argument(
         "--preset",
@@ -296,6 +309,15 @@ def main() -> int:
     if start >= int(args.steps):
         raise ValueError("T too small for washout+max_delay")
 
+    train_frac = float(args.train_frac)
+    if not (0.0 < train_frac <= 1.0):
+        raise ValueError("train-frac must be in (0, 1]")
+    post_len = int(args.steps) - start
+    train_len = max(1, int(round(post_len * train_frac)))
+    train_end = start + train_len
+    if train_end > int(args.steps):
+        train_end = int(args.steps)
+
     if bool(args.state_zscore):
         states_full = _zscore_states(states_full, start=start)
 
@@ -310,28 +332,32 @@ def main() -> int:
     # Add bias term to x.
     rls = RLS(dim=in_dim + 1, out_dim=len(delays), lam=float(args.lam), delta=float(args.delta), dtype=np.float64)
 
-    y_true: list[np.ndarray] = []
-    y_pred: list[np.ndarray] = []
+    X_train: list[np.ndarray] = []
+    Y_train: list[np.ndarray] = []
 
     for t in range(start, int(args.steps)):
         x = np.asarray(states[t, :], dtype=np.float64)
         x_aug = np.concatenate([x, np.array([1.0], dtype=np.float64)], axis=0)
 
         y_t = np.array([u[t - d] for d in delays], dtype=np.float64)
-        y_hat = rls.predict(x_aug).reshape(-1)
 
-        y_true.append(y_t)
-        y_pred.append(y_hat)
+        if t < train_end:
+            if (t - start) % int(args.update_every) == 0:
+                rls.update(x_aug, y_t)
+            X_train.append(x_aug)
+            Y_train.append(y_t)
 
-        if (t - start) % int(args.update_every) == 0:
-            rls.update(x_aug, y_t)
+    Xtr = np.stack(X_train, axis=0) if X_train else np.zeros((0, in_dim + 1), dtype=np.float64)
+    Y = np.stack(Y_train, axis=0) if Y_train else np.zeros((0, len(delays)), dtype=np.float64)
+    Yh = Xtr @ rls.W if Xtr.size else np.zeros((0, len(delays)), dtype=np.float64)
 
-    Y = np.stack(y_true, axis=0)
-    Yh = np.stack(y_pred, axis=0)
+    nan_pred_frac = float(np.mean(np.isnan(Yh))) if Yh.size else 0.0
+    nan_W = int(np.isnan(rls.W).any() or np.isnan(rls.P).any())
+    w_norm = float(np.linalg.norm(rls.W)) if not nan_W else float("nan")
 
     r2_by_delay: dict[int, float] = {}
     for i, d in enumerate(delays):
-        r2_by_delay[int(d)] = float(r2_score(Y[:, i], Yh[:, i]))
+        r2_by_delay[int(d)] = float(r2_score(Y[:, i], Yh[:, i])) if Y.shape[0] > 0 else 0.0
 
     mc_online = float(sum(max(0.0, v) for v in r2_by_delay.values()))
 
@@ -364,6 +390,9 @@ def main() -> int:
         proj_seed=int(args.proj_seed),
         mc_online=float(mc_online),
         r2_by_delay_json=json.dumps(r2_by_delay, ensure_ascii=False, sort_keys=True),
+        nan_pred_frac=float(nan_pred_frac),
+        nan_W=int(nan_W),
+        w_norm=float(w_norm),
     )
 
     fieldnames = list(Row.__annotations__.keys())
@@ -374,7 +403,7 @@ def main() -> int:
             w.writeheader()
         w.writerow({k: getattr(row, k) for k in fieldnames})
 
-    print(f"{state_mode} online MC={mc_online:.3f} (delays={len(delays)}, update_every={int(args.update_every)})")
+    print(f"{state_mode} online MC={mc_online:.3f} (train_frac={train_frac:.3g}, delays={len(delays)})")
     print("Wrote:", out_path)
     return 0
 
