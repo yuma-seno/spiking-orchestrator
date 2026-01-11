@@ -53,6 +53,7 @@ class STP_LIFNode(neuron.BaseNode):
         step_mode: str = "s",
         backend: str = "torch",
         store_v_seq: bool = False,
+        dc_bias: float = 0.0,
     ):
         super().__init__(
             v_threshold=v_threshold,
@@ -67,6 +68,7 @@ class STP_LIFNode(neuron.BaseNode):
         self.dt = float(dt)
         self.tau = float(tau)
         self.decay_input = bool(decay_input)
+        self.dc_bias = float(dc_bias)
 
         self.stp = stp or STPConfig()
         if not (0.0 < self.stp.U <= 1.0):
@@ -123,6 +125,8 @@ class STP_LIFNode(neuron.BaseNode):
         # Gate the input by STP efficacy.
         efficacy = (self.u * self.r).clamp(min=0.0, max=1.0)
         x_eff = x * efficacy
+        if self.dc_bias != 0.0:
+            x_eff = x_eff + float(self.dc_bias)
 
         # LIF membrane update.
         if self.decay_input:
