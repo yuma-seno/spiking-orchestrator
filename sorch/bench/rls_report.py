@@ -18,6 +18,7 @@ class Row:
     washout: int
     delays: str
     update_every: int
+    update_mode: str
     lam: float
     delta: float
     seed: int
@@ -59,6 +60,7 @@ def _load_rows(path: Path) -> list[Row]:
                     washout=int(float(_get(r, "washout", "0"))),
                     delays=_get(r, "delays", ""),
                     update_every=int(float(_get(r, "update_every", "0"))),
+                    update_mode=_get(r, "update_mode", ""),
                     lam=float(_get(r, "lam", "0")),
                     delta=float(_get(r, "delta", "0")),
                     seed=int(float(_get(r, "seed", "0"))),
@@ -116,6 +118,7 @@ def generate_report_markdown(csv_path: Path) -> str:
     uniq_washout = sorted({r.washout for r in rows})
     uniq_delays = sorted({r.delays for r in rows})
     uniq_update_every = sorted({r.update_every for r in rows})
+    uniq_update_mode = sorted({r.update_mode for r in rows})
     uniq_lam = sorted({r.lam for r in rows})
     uniq_delta = sorted({r.delta for r in rows})
     uniq_proj_out_dim = sorted({r.proj_out_dim for r in rows})
@@ -131,6 +134,7 @@ def generate_report_markdown(csv_path: Path) -> str:
         key: key_type = (
             r.delays,
             r.update_every,
+            r.update_mode,
             r.lam,
             r.delta,
             r.n,
@@ -193,6 +197,7 @@ def generate_report_markdown(csv_path: Path) -> str:
     lines.append(f"- washout: {_fmt_list(uniq_washout)}")
     lines.append(f"- delays: {_fmt_list(uniq_delays)}")
     lines.append(f"- update_every: {_fmt_list(uniq_update_every)}")
+    lines.append(f"- update_mode: {_fmt_list(uniq_update_mode)}")
     lines.append(f"- lam: {_fmt_list([f'{x:.6g}' for x in uniq_lam])}")
     lines.append(f"- delta: {_fmt_list([f'{x:.6g}' for x in uniq_delta])}")
     lines.append(f"- state_mode: {_fmt_list(uniq_state_mode)}")
@@ -214,13 +219,14 @@ def generate_report_markdown(csv_path: Path) -> str:
         "n_runs",
         "delays",
         "update_every",
+        "update_mode",
         "lam",
         "delta",
         "state_mode",
         "proj_out_dim",
         "spike_rate(mean)",
     ]
-    aligns = ["---:", "---:", "---:", "---:", ":--", "---:", "---:", "---:", ":--", "---:", "---:"]
+    aligns = ["---:", "---:", "---:", "---:", ":--", "---:", ":--", "---:", "---:", ":--", "---:", "---:"]
     lines.append("| " + " | ".join(cols) + " |")
     lines.append("|" + "|".join(aligns) + "|")
 
@@ -230,6 +236,7 @@ def generate_report_markdown(csv_path: Path) -> str:
         (
             delays_s,
             update_every,
+            update_mode,
             lam,
             delta,
             _n,
@@ -255,6 +262,7 @@ def generate_report_markdown(csv_path: Path) -> str:
                     str(n_runs),
                     str(delays_s),
                     str(update_every),
+                    str(update_mode),
                     f"{float(lam):.6g}",
                     f"{float(delta):.6g}",
                     str(state_mode),

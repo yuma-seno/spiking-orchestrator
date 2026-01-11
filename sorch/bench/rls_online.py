@@ -95,6 +95,7 @@ class Row:
     washout: int
     delays: str
     update_every: int
+    update_mode: str
     lam: float
     delta: float
     seed: int
@@ -140,8 +141,18 @@ def main() -> int:
     ap.add_argument(
         "--update-every",
         type=int,
-        default=1,
-        help="RLS update interval in steps (this benchmark typically needs 1)",
+        default=10,
+        help="RLS update interval in steps (e.g., 10 means ~10ms if dt=1ms)",
+    )
+    ap.add_argument(
+        "--update-mode",
+        type=str,
+        default="block",
+        choices=["block", "sample"],
+        help=(
+            "how to apply RLS updates. 'sample' updates using only every N-th sample (subsampling). "
+            "'block' accumulates the last N samples and applies a block update (recommended for N>1)."
+        ),
     )
     ap.add_argument(
         "--train-frac",
@@ -329,11 +340,17 @@ def main() -> int:
 
     in_dim = int(states.shape[1])
 
+    update_every = int(args.update_every)
+    update_mode = str(args.update_mode)
+
     # Add bias term to x.
     rls = RLS(dim=in_dim + 1, out_dim=len(delays), lam=float(args.lam), delta=float(args.delta), dtype=np.float64)
 
     X_train: list[np.ndarray] = []
     Y_train: list[np.ndarray] = []
+
+    buf_X: list[np.ndarray] = []
+    buf_Y: list[np.ndarray] = []
 
     for t in range(start, int(args.steps)):
         x = np.asarray(states[t, :], dtype=np.float64)
@@ -342,10 +359,28 @@ def main() -> int:
         y_t = np.array([u[t - d] for d in delays], dtype=np.float64)
 
         if t < train_end:
-            if (t - start) % int(args.update_every) == 0:
-                rls.update(x_aug, y_t)
             X_train.append(x_aug)
             Y_train.append(y_t)
+
+            if update_mode == "sample":
+                # Subsampling update (kept for ablation).
+                if (t - start) % update_every == 0:
+                    rls.update(x_aug, y_t)
+            else:
+                # Block update: use all samples, update once per block.
+                buf_X.append(x_aug)
+                buf_Y.append(y_t)
+                if len(buf_X) >= update_every:
+                    Xb = np.stack(buf_X, axis=0)
+                    Yb = np.stack(buf_Y, axis=0)
+                    rls.update_block(Xb, Yb, lam=float(args.lam) ** float(len(buf_X)))
+                    buf_X.clear()
+                    buf_Y.clear()
+
+    if update_mode == "block" and buf_X:
+        Xb = np.stack(buf_X, axis=0)
+        Yb = np.stack(buf_Y, axis=0)
+        rls.update_block(Xb, Yb, lam=float(args.lam) ** float(len(buf_X)))
 
     Xtr = np.stack(X_train, axis=0) if X_train else np.zeros((0, in_dim + 1), dtype=np.float64)
     Y = np.stack(Y_train, axis=0) if Y_train else np.zeros((0, len(delays)), dtype=np.float64)
@@ -367,6 +402,7 @@ def main() -> int:
         washout=int(args.washout),
         delays=str(args.delays),
         update_every=int(args.update_every),
+        update_mode=str(args.update_mode),
         lam=float(args.lam),
         delta=float(args.delta),
         seed=int(args.seed),
@@ -403,7 +439,9 @@ def main() -> int:
             w.writeheader()
         w.writerow({k: getattr(row, k) for k in fieldnames})
 
-    print(f"{state_mode} online MC={mc_online:.3f} (train_frac={train_frac:.3g}, delays={len(delays)})")
+    print(
+        f"{state_mode} online MC={mc_online:.3f} (mode={str(args.update_mode)}, update_every={int(args.update_every)}, train_frac={train_frac:.3g})"
+    )
     print("Wrote:", out_path)
     return 0
 

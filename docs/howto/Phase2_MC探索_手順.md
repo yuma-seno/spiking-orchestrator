@@ -157,8 +157,15 @@ MCが大きく伸びることがあります（その分、次元が増えるた
   --out outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv; done`
 
 補足:
-- `rls_online` のデフォルト（推奨）: `--update-every 1 --lam 1.0 --delta 0.01`
-  - `update_every>1` だと今回の条件では R^2 が負に崩れて `mc_online=0` になりやすい
+- `rls_online` のデフォルト（推奨）: `--update-mode block --update-every 10 --lam 1.0 --delta 0.01`
+  - `update_every>1` のときは `--update-mode block` を使う（サンプルを捨てずにまとめて更新する）
+  - `--update-mode sample` は比較用（N間引き更新）
+
+### 更新間隔（10–50ms）を試す
+- `for u in 10 20 50; do python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed 0 \
+    --state-mode v+spike --proj-out-dim 200 \
+    --update-mode block --update-every $u --lam 1.0 --delta 0.01 \
+  --out outputs/phase2/rls/runs/phase2_rls_online_block_sweep_smoke.csv; done`
 
 ### レポート化
 - `python -m sorch.bench.rls_report --csv outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv \
