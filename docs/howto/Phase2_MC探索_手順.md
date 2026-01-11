@@ -167,6 +167,28 @@ MCが大きく伸びることがあります（その分、次元が増えるた
     --update-mode block --update-every $u --lam 1.0 --delta 0.01 \
   --out outputs/phase2/rls/runs/phase2_rls_online_block_sweep_smoke.csv; done`
 
+### 忘却あり（`lam<1`）を試す（推奨値の目安）
+
+注意: MCベンチは「定常な過去入力を復元できるか」を見ているため、忘却を強くすると性能が下がりやすいです。
+
+今回のベンチ設定（`state_mode=v+spike`, `proj_out_dim=200`, `update_mode=block`, `update_every=10`, `delta=0.01`）では:
+
+- `lam=0.999` は動作するが、`lam=1.0` より `mc_online` が下がる
+- `lam<=0.995` は重みノルムが増大して `mc_online=0` に崩れやすい
+
+レポート（repeats5）:
+- [outputs/phase2/rls/reports/phase2_rls_online_block_lam_sweep_repeats5_report.md](../../outputs/phase2/rls/reports/phase2_rls_online_block_lam_sweep_repeats5_report.md)
+
+推奨（このベンチの範囲）:
+- ベンチ用途: `--lam 1.0`
+- 忘却を入れて挙動を見たい: まず `--lam 0.999` から
+
+実行例（repeats）:
+- `for lam in 1.0 0.999 0.995 0.99; do for s in 0 1 2 3 4; do python -m sorch.bench.rls_online --preset convo_spiking --n 120 --steps 3000 --washout 300 --seed $s \
+    --state-mode v+spike --proj-out-dim 200 \
+    --update-mode block --update-every 10 --lam $lam --delta 0.01 \
+  --out outputs/phase2/rls/runs/phase2_rls_online_block_lam_sweep_repeats5.csv; done; done`
+
 ### レポート化
 - `python -m sorch.bench.rls_report --csv outputs/phase2/rls/runs/phase2_rls_online_repeats5.csv \
     --out outputs/phase2/rls/reports/phase2_rls_online_repeats5_report.md`
