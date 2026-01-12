@@ -660,25 +660,32 @@ def main() -> int:
 
     out_path = Path(args.output)
     if out_path.exists():
-        latencies: list[int] = []
-        physical_latencies: list[int] = []
+        latencies_by_reason: dict[str, list[int]] = {}
+        physical_latencies_by_reason: dict[str, list[int]] = {}
         with out_path.open("r", encoding="utf-8") as f:
             for line in f:
                 try:
                     ev = json.loads(line)
                 except Exception:
                     continue
-                latencies.append(int(ev.get("latency_ns", 0)))
+                reason = str(ev.get("reason", "unknown"))
+                lat = int(ev.get("latency_ns", 0) or 0)
+                latencies_by_reason.setdefault(reason, []).append(lat)
+
                 physical_lat = int(ev.get("latency_physical_ns", 0) or 0)
                 if physical_lat > 0:
-                    physical_latencies.append(physical_lat)
+                    physical_latencies_by_reason.setdefault(reason, []).append(physical_lat)
 
-        summary = summarize_latencies_ns(latencies)
-        print("Phase3 stop latency summary (audio->motor detect):", summary)
-        if physical_latencies:
-            phys_summary = summarize_latencies_ns(physical_latencies)
-            print("Phase3 stop latency summary (audio->motor physical):", phys_summary)
-        print(f"events={len(latencies)} output={out_path}")
+        total = sum(len(v) for v in latencies_by_reason.values())
+        for reason, lats in sorted(latencies_by_reason.items(), key=lambda kv: kv[0]):
+            summary = summarize_latencies_ns(lats)
+            print(f"Phase3 stop latency summary detect [{reason}]:", summary)
+
+        for reason, lats in sorted(physical_latencies_by_reason.items(), key=lambda kv: kv[0]):
+            summary = summarize_latencies_ns(lats)
+            print(f"Phase3 stop latency summary physical [{reason}]:", summary)
+
+        print(f"events={total} output={out_path}")
     else:
         print("No events were written.")
 
