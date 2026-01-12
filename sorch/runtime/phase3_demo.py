@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from sorch.audio.features import AudioFeatures, compute_features
+from sorch.ipc.control_vec import ControlVecHandle
 from sorch.ipc.spsc_ring import SharedSpscRing, SpscRingHandle
 from sorch.ipc.stop_flag import StopFlagHandle
 from sorch.reflex.dsp_reflex import ReflexConfig, ReflexDSP
@@ -166,6 +167,7 @@ def _core_proc(
     feat_ring: SpscRingHandle,
     stop_ring: SpscRingHandle,
     stop_flag: StopFlagHandle,
+    control_vec: ControlVecHandle,
     shutdown_event,
     holdoff_ms: float,
     dt_ms: float,
@@ -183,8 +185,10 @@ def _core_proc(
     )
 
     from sorch.ipc.stop_flag import StopFlag
+    from sorch.ipc.control_vec import ControlVec
 
     sf = StopFlag(stop_flag)
+    cv = ControlVec(control_vec)
 
     try:
         while not shutdown_event.is_set():
@@ -204,6 +208,15 @@ def _core_proc(
 
             decision = reflex.update(feats, t_feat_done_ns)
             t_decision_ns = time.perf_counter_ns()
+
+            # Minimal Action Plan (u): keep Core→Motor I/O fixed and small.
+            # For now this demo uses u[0] as a soft output gate:
+            # - 1.0: allow output
+            # - 0.0: suppress output while the user is likely speaking
+            # Hard Stop is still handled via the independent stop_flag fast path.
+            likely_user_speaking = bool(feats.voicing and (feats.rms > float(decision.threshold)))
+            u_gate = 0.0 if likely_user_speaking else 1.0
+            cv.publish([u_gate, 0.0, 0.0], t_ns=t_decision_ns)
 
             if decision.stop_signal:
                 # Priority path: publish stop flag first.
@@ -235,6 +248,7 @@ def _motor_proc(
     *,
     stop_ring: SpscRingHandle,
     stop_flag: StopFlagHandle,
+    control_vec: ControlVecHandle,
     shutdown_event,
     out_jsonl: str,
     seconds: float,
@@ -252,8 +266,10 @@ def _motor_proc(
     stop_rb = SharedSpscRing.attach(stop_ring)
 
     from sorch.ipc.stop_flag import StopFlag
+    from sorch.ipc.control_vec import ControlVec
 
     sf = StopFlag(stop_flag)
+    cv = ControlVec(control_vec)
 
     out_path = Path(out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -338,12 +354,17 @@ def _motor_proc(
                                 error="",
                             )
 
+                        # Soft control (Action Plan u): can suppress output without creating a stop event.
+                        # Keep semantics intentionally minimal: u[0] is an output gate in [0, 1].
+                        _, _, u = cv.snapshot()
+                        soft_gate = float(u[0]) if u else 1.0
+
                         # Physical hard stop: request stream termination from callback.
                         if callback_should_complete:
                             callback_should_complete = False
                             return (b"\x00" * (frame_count * ch * 4), pyaudio.paComplete)
 
-                        if not output_enabled:
+                        if (not output_enabled) or (soft_gate < 0.5):
                             return (b"\x00" * (frame_count * ch * 4), pyaudio.paContinue)
 
                         if out_buf:
@@ -584,8 +605,10 @@ def main() -> int:
     stop_rb = SharedSpscRing.create(capacity=256, item_shape=(8,), dtype=np.float64)
 
     from sorch.ipc.stop_flag import StopFlag
+    from sorch.ipc.control_vec import ControlVec
 
     stop_flag = StopFlag.create(ctx)
+    control_vec = ControlVec.create(ctx, dim=3)
 
     try:
         p_audio = ctx.Process(
@@ -609,6 +632,7 @@ def main() -> int:
                 feat_ring=feat_rb.handle(),
                 stop_ring=stop_rb.handle(),
                 stop_flag=stop_flag.handle(),
+                control_vec=control_vec.handle(),
                 shutdown_event=shutdown_event,
                 holdoff_ms=float(args.holdoff_ms),
                 dt_ms=float(dt_ms),
@@ -621,6 +645,7 @@ def main() -> int:
             kwargs=dict(
                 stop_ring=stop_rb.handle(),
                 stop_flag=stop_flag.handle(),
+                control_vec=control_vec.handle(),
                 shutdown_event=shutdown_event,
                 out_jsonl=str(args.output),
                 seconds=float(args.seconds),
