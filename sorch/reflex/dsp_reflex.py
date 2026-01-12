@@ -31,6 +31,8 @@ class ReflexState:
 @dataclass(frozen=True, slots=True)
 class ReflexDecision:
     stop_signal: bool
+    interrupt_cue: bool
+    cue_strength: float
     threshold: float
     in_holdoff: bool
     reason: str
@@ -64,6 +66,15 @@ class ReflexDSP:
         in_holdoff = now_ns < int(self.state.holdoff_until_ns)
         threshold = float(self.state.mu_noise + self.config.alpha)
 
+        centroid_ok = (self.config.min_centroid_hz <= features.spectral_centroid_hz <= self.config.max_centroid_hz)
+        zcr_ok = (features.zcr <= self.config.max_zcr)
+        over_threshold = (features.rms > threshold)
+
+        # Soft Interrupt is an observation cue, not a stop command.
+        # Keep it independent from holdoff/stop gating so downstream policy can learn.
+        interrupt_cue = bool((not loopback_active) and over_threshold and (features.voicing or (zcr_ok and centroid_ok)))
+        cue_strength = float(max(0.0, features.rms - threshold))
+
         # Estimate noise floor only on (likely) non-speech frames.
         likely_non_speech = (not features.voicing) and (features.rms <= threshold)
         if likely_non_speech:
@@ -73,6 +84,8 @@ class ReflexDSP:
         if in_holdoff:
             return ReflexDecision(
                 stop_signal=False,
+                interrupt_cue=interrupt_cue,
+                cue_strength=cue_strength,
                 threshold=threshold,
                 in_holdoff=True,
                 reason="holdoff",
@@ -81,20 +94,20 @@ class ReflexDSP:
         if loopback_active:
             return ReflexDecision(
                 stop_signal=False,
+                interrupt_cue=False,
+                cue_strength=0.0,
                 threshold=threshold,
                 in_holdoff=False,
                 reason="loopback_suppressed",
             )
-
-        centroid_ok = (self.config.min_centroid_hz <= features.spectral_centroid_hz <= self.config.max_centroid_hz)
-        zcr_ok = (features.zcr <= self.config.max_zcr)
-        over_threshold = (features.rms > threshold)
 
         if over_threshold and features.voicing and zcr_ok and centroid_ok:
             holdoff_ns = int(self.config.holdoff_ms * 1_000_000)
             self.state.holdoff_until_ns = int(now_ns + holdoff_ns)
             return ReflexDecision(
                 stop_signal=True,
+                interrupt_cue=interrupt_cue,
+                cue_strength=cue_strength,
                 threshold=threshold,
                 in_holdoff=False,
                 reason="stop",
@@ -102,6 +115,8 @@ class ReflexDSP:
 
         return ReflexDecision(
             stop_signal=False,
+            interrupt_cue=interrupt_cue,
+            cue_strength=cue_strength,
             threshold=threshold,
             in_holdoff=False,
             reason="no_trigger",

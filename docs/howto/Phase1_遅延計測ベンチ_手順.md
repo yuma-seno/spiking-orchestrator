@@ -21,9 +21,15 @@
 - 実機（安全に無音出力）
   - `python -m sorch.bench.latency_bench --seconds 20 --sample-rate 48000 --frames 128 --output-mode silence`
 
+- 実機（より物理寄りの停止：close/reopenを含めて記録）
+  - `python -m sorch.bench.latency_bench --seconds 20 --sample-rate 48000 --frames 128 --output-mode silence --stop-mode close_reopen`
+
 ## 出力
 - JSONL（stopイベント）: `outputs/phase1/latency/`
 - 集計レポート: `outputs/phase1/report/`
+
+補足:
+- JSONL と同名の `*.meta.json` に、計測条件（frames/sample_rate等）を保存します。
 
 ## 判定
 - 平均ではなく **p95/p99** を重視する（たまに遅いケースが体験を壊すため）

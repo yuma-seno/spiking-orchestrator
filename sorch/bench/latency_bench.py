@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,13 +23,25 @@ class StopEvent:
     t_feat_done_ns: int
     t_decision_ns: int
     t_stop_done_ns: int
+    t_stream_inactive_ns: int
+    t_stream_closed_ns: int
+    t_stream_reopened_ns: int
     latency_ns: int
+    latency_physical_ns: int
     rms: float
     zcr: float
     centroid_hz: float
     voicing: bool
+    interrupt_cue: bool
+    cue_strength: float
     threshold: float
     reason: str
+    stop_mode: str
+
+
+def _meta_path(out_path: Path) -> Path:
+    # Keep the JSONL schema focused on per-event data; write run config separately.
+    return out_path.with_suffix(out_path.suffix + ".meta.json")
 
 
 def _open_pyaudio():
@@ -59,7 +73,7 @@ def main() -> int:
     ap.add_argument("--holdoff-ms", type=float, default=300.0)
     ap.add_argument("--alpha", type=float, default=0.03)
     ap.add_argument("--noise-tau-s", type=float, default=1.0)
-    ap.add_argument("--output", type=str, default="outputs/latency_events.jsonl")
+    ap.add_argument("--output", type=str, default="outputs/phase1/latency/latency_events.jsonl")
     ap.add_argument("--resume-after-ms", type=float, default=500.0, help="restart output after stop")
     ap.add_argument(
         "--output-mode",
@@ -70,6 +84,13 @@ def main() -> int:
     )
     ap.add_argument("--output-gain", type=float, default=0.0, help="0.0..1.0 (use small values)")
     ap.add_argument("--tone-hz", type=float, default=220.0)
+    ap.add_argument(
+        "--stop-mode",
+        type=str,
+        default="stop_stream",
+        choices=["stop_stream", "close_reopen"],
+        help="how to stop output on trigger (close_reopen approximates physical stop)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="no audio devices; synthetic input")
     args = ap.parse_args()
 
@@ -87,6 +108,22 @@ def main() -> int:
         raise SystemExit("--output-channels は 1 または 2 を指定してください")
 
     dt_ms = (args.frames / input_sr) * 1000.0
+
+    meta = {
+        "tool": "sorch.bench.latency_bench",
+        "timestamp_unix_s": time.time(),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "args": vars(args),
+        "derived": {
+            "input_sr": input_sr,
+            "output_sr": output_sr,
+            "input_channels": input_channels,
+            "output_channels": output_channels,
+            "dt_ms": dt_ms,
+        },
+    }
+    _meta_path(out_path).write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     reflex = ReflexDSP(
         ReflexConfig(
             dt_ms=dt_ms,
@@ -117,6 +154,9 @@ def main() -> int:
 
             if decision.stop_signal:
                 t_stop_done_ns = time.perf_counter_ns()
+                t_stream_inactive_ns = 0
+                t_stream_closed_ns = 0
+                t_stream_reopened_ns = 0
                 latency_ns = t_stop_done_ns - t_read_done_ns
                 stop_events.append(
                     StopEvent(
@@ -125,13 +165,20 @@ def main() -> int:
                         t_feat_done_ns=t_feat_done_ns,
                         t_decision_ns=t_decision_ns,
                         t_stop_done_ns=t_stop_done_ns,
+                        t_stream_inactive_ns=t_stream_inactive_ns,
+                        t_stream_closed_ns=t_stream_closed_ns,
+                        t_stream_reopened_ns=t_stream_reopened_ns,
                         latency_ns=latency_ns,
+                        latency_physical_ns=0,
                         rms=feats.rms,
                         zcr=feats.zcr,
                         centroid_hz=feats.spectral_centroid_hz,
                         voicing=feats.voicing,
+                        interrupt_cue=decision.interrupt_cue,
+                        cue_strength=decision.cue_strength,
                         threshold=decision.threshold,
                         reason=decision.reason,
+                        stop_mode=str(args.stop_mode),
                     )
                 )
             seq += 1
@@ -211,6 +258,7 @@ def main() -> int:
 
     t_end = time.perf_counter() + float(args.seconds)
     last_resume_ns = 0
+    pending_reopen_event_idx: int | None = None
 
     try:
         if output_stream is not None:
@@ -226,7 +274,30 @@ def main() -> int:
                 else:
                     # resume after cooldown
                     if last_resume_ns and (time.perf_counter_ns() - last_resume_ns) >= int(args.resume_after_ms * 1e6):
-                        output_stream.start_stream()
+                        if args.stop_mode == "close_reopen":
+                            output_stream = pa.open(
+                                format=pyaudio.paFloat32,
+                                channels=output_channels,
+                                rate=output_sr,
+                                output=True,
+                                frames_per_buffer=out_frames,
+                                output_device_index=args.output_device,
+                                start=True,
+                            )
+                        else:
+                            output_stream.start_stream()
+
+                        t_reopen_ns = time.perf_counter_ns()
+                        if pending_reopen_event_idx is not None:
+                            ev = stop_events[pending_reopen_event_idx]
+                            stop_events[pending_reopen_event_idx] = StopEvent(
+                                **{
+                                    **asdict(ev),
+                                    "t_stream_reopened_ns": int(t_reopen_ns),
+                                }
+                            )
+                            pending_reopen_event_idx = None
+
                         last_resume_ns = 0
 
             assert input_stream is not None
@@ -245,15 +316,36 @@ def main() -> int:
             t_decision_ns = time.perf_counter_ns()
 
             if decision.stop_signal:
+                t_stream_inactive_ns = 0
+                t_stream_closed_ns = 0
+                t_stream_reopened_ns = 0
+
                 if output_stream is not None and output_stream.is_active():
-                    output_stream.stop_stream()
-                    t_stop_done_ns = time.perf_counter_ns()
-                    last_resume_ns = t_stop_done_ns
+                    if args.stop_mode == "close_reopen":
+                        output_stream.stop_stream()
+                        t_stop_done_ns = time.perf_counter_ns()
+                        t_stream_inactive_ns = t_stop_done_ns
+
+                        output_stream.close()
+                        t_stream_closed_ns = time.perf_counter_ns()
+                        output_stream = None
+                        last_resume_ns = t_stream_closed_ns
+                    else:
+                        output_stream.stop_stream()
+                        t_stop_done_ns = time.perf_counter_ns()
+                        t_stream_inactive_ns = t_stop_done_ns
+                        last_resume_ns = t_stop_done_ns
                 else:
                     # No output stream: approximate stop timestamp right after decision.
                     t_stop_done_ns = time.perf_counter_ns()
 
                 latency_ns = t_stop_done_ns - t_read_done_ns
+                latency_physical_ns = 0
+                if t_stream_closed_ns:
+                    latency_physical_ns = int(t_stream_closed_ns - t_read_done_ns)
+                elif t_stream_inactive_ns:
+                    latency_physical_ns = int(t_stream_inactive_ns - t_read_done_ns)
+
                 stop_events.append(
                     StopEvent(
                         seq=len(stop_events) + 1,
@@ -261,15 +353,25 @@ def main() -> int:
                         t_feat_done_ns=t_feat_done_ns,
                         t_decision_ns=t_decision_ns,
                         t_stop_done_ns=t_stop_done_ns,
+                        t_stream_inactive_ns=t_stream_inactive_ns,
+                        t_stream_closed_ns=t_stream_closed_ns,
+                        t_stream_reopened_ns=t_stream_reopened_ns,
                         latency_ns=latency_ns,
+                        latency_physical_ns=latency_physical_ns,
                         rms=feats.rms,
                         zcr=feats.zcr,
                         centroid_hz=feats.spectral_centroid_hz,
                         voicing=feats.voicing,
+                        interrupt_cue=decision.interrupt_cue,
+                        cue_strength=decision.cue_strength,
                         threshold=decision.threshold,
                         reason=decision.reason,
+                        stop_mode=str(args.stop_mode),
                     )
                 )
+
+                if args.stop_mode == "close_reopen":
+                    pending_reopen_event_idx = len(stop_events) - 1
 
     finally:
         with out_path.open("w", encoding="utf-8") as f:

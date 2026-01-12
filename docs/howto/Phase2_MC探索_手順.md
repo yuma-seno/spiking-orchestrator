@@ -28,3 +28,7 @@
 - CSV: `outputs/phase2/mc/runs/`
 - レポート: `outputs/phase2/mc/reports/`
 
+保存方針（推奨）:
+- 生CSVはサイズが増えるため Git から除外し、Markdownレポートを残す
+- 実際の挙動は `.gitignore` を正とする
+
